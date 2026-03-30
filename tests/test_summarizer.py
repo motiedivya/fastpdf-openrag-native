@@ -1400,6 +1400,7 @@ class LayeredOutputGateway:
                         "plan": ["ENT follow up with possible surgery or laser treatment"],
                         "follow_up": ["prn"],
                         "positive_ros": ["muscle or joint pain"],
+                        "positive_physical_exam": ["well-appearing with normal ear and oropharyngeal findings"],
                         "residual_supported_facts": ["Right ear hearing loss could not be corrected with aides"],
                     }
                 ),
@@ -1410,7 +1411,7 @@ class LayeredOutputGateway:
                 json.dumps(
                     {
                         "title": "Layered Scope",
-                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. Chief complaint was possible right ear infection with right ear pain for a couple of weeks. Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Plan included ENT follow up with possible surgery or laser treatment.",
+                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. Chief complaint was possible right ear infection with right ear pain for a couple of weeks. History of present illness documented right ear pain for 2 weeks with prior upper respiratory infection resolved. Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Plan included ENT follow up with possible surgery or laser treatment.",
                         "sections": [
                             {
                                 "title": "On 09/12/2018",
@@ -1418,9 +1419,32 @@ class LayeredOutputGateway:
                                 "items": [
                                     {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin.", "fact_ids": ["note-001__intro__01"]},
                                     {"text": "Chief complaint was possible right ear infection with right ear pain for a couple of weeks.", "fact_ids": ["note-001__chief_complaint__01"]},
+                                    {"text": "History of present illness documented right ear pain for 2 weeks with prior upper respiratory infection resolved.", "fact_ids": ["note-001__hpi__01"]},
                                     {"text": "Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
                                     {"text": "Diagnoses included otalgia right ear H92.01.", "fact_ids": ["note-001__diagnoses__01"]},
                                     {"text": "Plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__plan__01"]}
+                                ]
+                            }
+                        ]
+                    }
+                ),
+                [],
+            )
+        if "presentation-layer editor" in message:
+            return (
+                json.dumps(
+                    {
+                        "title": "Layered Scope",
+                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. He reported possible right ear infection with right ear pain for a couple of weeks, and the history of present illness noted a resolved prior upper respiratory infection. Medications on file included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. The assessment documented otalgia right ear H92.01, and the plan included ENT follow up with possible surgery or laser treatment.",
+                        "sections": [
+                            {
+                                "title": "On 09/12/2018",
+                                "note_id": "note-001",
+                                "items": [
+                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin.", "fact_ids": ["note-001__intro__01"]},
+                                    {"text": "He reported possible right ear infection with right ear pain for a couple of weeks, and the history of present illness noted a resolved prior upper respiratory infection.", "fact_ids": ["note-001__chief_complaint__01", "note-001__hpi__01"]},
+                                    {"text": "Medications on file included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
+                                    {"text": "The assessment documented otalgia right ear H92.01, and the plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__diagnoses__01", "note-001__plan__01"]}
                                 ]
                             }
                         ]
@@ -1516,6 +1540,8 @@ def test_summarize_scope_emits_truth_validation_and_presentation_layers(tmp_path
         extractor_llm_model="gpt-5-extractor",
         renderer_llm_provider="openai",
         renderer_llm_model="gpt-5-renderer",
+        editor_llm_provider="openai",
+        editor_llm_model="gpt-5-editor",
     )
 
     result = asyncio.run(
@@ -1529,13 +1555,20 @@ def test_summarize_scope_emits_truth_validation_and_presentation_layers(tmp_path
     assert any("H92.01" in fact.value for fact in truth_note.diagnoses)
     assert result.validation_layer is not None
     assert result.validation_layer.passed is True
+    assert result.presentation_plan is not None
+    assert result.presentation_draft is not None
     assert result.presentation_layer is not None
-    assert result.presentation_layer.debug["renderer"] == "llm"
+    assert result.presentation_plan.debug["renderer"] == "deterministic_plan"
+    assert result.presentation_draft.debug["renderer"] == "llm_draft"
+    assert result.presentation_layer.debug["renderer"] == "llm_editor"
     assert result.presentation_layer.debug["rendered_by_model"] is True
     assert result.debug["layered_output_used"] is True
     assert result.supported_summary.startswith("On 09/12/2018")
     assert "Susette Eaves CFNP" in result.supported_summary
     assert "hydrocodone acetaminophen 5-325 mg tablet" in result.supported_summary
-    assert any(item.field_name == "diagnoses" for section in result.presentation_layer.sections for item in section.items)
+    assert "well-appearing" not in result.supported_summary.lower()
+    assert not any(item.field_name == "positive_physical_exam" for section in result.presentation_plan.sections for item in section.items)
+    assert any("note-001__diagnoses__01" in item.fact_ids for section in result.presentation_layer.sections for item in section.items)
     assert any(call["llm_model"] == "gpt-5-extractor" for call in gateway.override_calls if "strict supported fact sheet" in str(call["message"]))
     assert any(call["llm_model"] == "gpt-5-renderer" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer renderer" in str(call["message"]))
+    assert any(call["llm_model"] == "gpt-5-editor" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer editor" in str(call["message"]))

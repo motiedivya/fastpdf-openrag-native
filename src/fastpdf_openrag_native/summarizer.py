@@ -1477,6 +1477,8 @@ async def summarize_scope(
         truth_layer_page_debug = [row[1] for row in truth_layer_results]
     truth_layer = group_truth_layer_notes(list(truth_layer_pages)) if truth_layer_pages else []
     validation_layer = validate_truth_layer(list(truth_layer)) if truth_layer else None
+    presentation_plan = None
+    presentation_draft = None
     presentation_layer = None
     layered_output_used = False
     layered_output_structured = any(
@@ -1484,7 +1486,13 @@ async def summarize_scope(
         for note in truth_layer
     )
     if truth_layer:
-        presentation_candidate, presentation_verified_sentences, presentation_supported_summary = await render_presentation_layer(
+        (
+            presentation_plan,
+            presentation_draft,
+            presentation_candidate,
+            presentation_verified_sentences,
+            presentation_supported_summary,
+        ) = await render_presentation_layer(
             gateway,
             notes=list(truth_layer),
             scope=scope,
@@ -1513,6 +1521,8 @@ async def summarize_scope(
         unsupported_sentences=unsupported_sentences,
         truth_layer=list(truth_layer),
         validation_layer=validation_layer,
+        presentation_plan=presentation_plan,
+        presentation_draft=presentation_draft,
         presentation_layer=presentation_layer,
         debug={
             "page_requests": page_debug,
@@ -1550,6 +1560,8 @@ async def summarize_scope(
             "truth_layer_page_debug": truth_layer_page_debug,
             "truth_layer": [row.model_dump(mode="json") for row in truth_layer],
             "validation_layer": validation_layer.model_dump(mode="json") if validation_layer else None,
+            "presentation_plan": presentation_plan.model_dump(mode="json") if presentation_plan else None,
+            "presentation_draft": presentation_draft.model_dump(mode="json") if presentation_draft else None,
             "presentation_layer": presentation_layer.model_dump(mode="json") if presentation_layer else None,
             "layered_output_used": layered_output_used,
             "layered_output_structured": layered_output_structured,

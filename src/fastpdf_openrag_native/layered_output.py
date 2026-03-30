@@ -19,7 +19,7 @@ from .models import (
     ValidationLayer,
     VerifiedSentence,
 )
-from .prompts import build_presentation_layer_prompt, build_truth_layer_prompt
+from .prompts import build_presentation_editor_prompt, build_presentation_layer_prompt, build_truth_layer_prompt
 from .settings import AppSettings
 
 UNIT_TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -63,6 +63,18 @@ FACILITY_SIGNAL_RE = re.compile(r"\b(?:clinic|medical|center|hospital|office|hea
 PROVIDER_SIGNAL_RE = re.compile(r"\b(?:m\.d\.|d\.o\.|np\b|pa\b|cfnp|physician|provider|dr\.)\b", flags=re.IGNORECASE)
 NOTE_TYPE_SIGNAL_RE = re.compile(r"\b(?:visit note|progress note|operative note|phone ?msg|final report|procedure note|history and physical)\b", flags=re.IGNORECASE)
 PATIENT_SIGNAL_RE = re.compile(r"\b(?:mr\.|mrs\.|ms\.|patient|dob)\b", flags=re.IGNORECASE)
+NORMAL_FINDING_SIGNAL_RE = re.compile(
+    r"\b(?:well[- ]appearing|not in acute distress|normal|regular rate and rhythm|s1 and s2|no murmurs|no rubs|no gallops|well perfused|radial pulses(?:\s*2\+)?|no cervical adenopathy|normal mood and affect|appropriate judgment and insight|grossly intact memory|alert and oriented(?: status)?|cranial nerves grossly intact|normal gait|equal movement of all extremities|normal ear|normal oropharyngeal|oropharyngeal findings)\b",
+    flags=re.IGNORECASE,
+)
+NEGATIVE_FINDING_SIGNAL_RE = re.compile(
+    r"\b(?:denies|negative for|without distress|without abnormality|no\s+(?:murmurs?|rubs?|gallops?|cervical adenopathy|acute distress|focal deficits?|edema))\b",
+    flags=re.IGNORECASE,
+)
+POSITIVE_PRESENTATION_SIGNAL_RE = re.compile(
+    r"\b(?:pain|tender|swelling|infection|hearing loss|otalgia|abnormal|positive|limited|decreased|effusion|erythema|lesion|mass|ulcer|callback|clearance|procedure|block|injection|diagnosis|plan|follow[- ]?up|medication|allerg(?:y|ies)|icd|hpi|chief complaint)\b",
+    flags=re.IGNORECASE,
+)
 
 PRESENTATION_FIELD_ORDER = (
     "chief_complaint",
@@ -575,6 +587,33 @@ def _first_value(note: TruthLayerNote, field_name: str) -> str:
     return values[0] if values else ""
 
 
+def _looks_like_normal_finding(text: str) -> bool:
+    clean = _sanitize_generated_text(text)
+    if not clean:
+        return False
+    return bool(
+        (NORMAL_FINDING_SIGNAL_RE.search(clean) or NEGATIVE_FINDING_SIGNAL_RE.search(clean))
+        and not POSITIVE_PRESENTATION_SIGNAL_RE.search(clean)
+    )
+
+
+def _filter_presentable_facts(field_name: str, facts: list[SupportedFact]) -> list[SupportedFact]:
+    if field_name not in {"positive_ros", "positive_physical_exam", "residual_supported_facts"}:
+        return facts
+    filtered: list[SupportedFact] = []
+    for fact in facts:
+        clean = _clean_fact_value(fact.value)
+        if not clean:
+            continue
+        if _looks_like_normal_finding(clean):
+            if field_name in {"positive_ros", "positive_physical_exam"}:
+                continue
+            if PE_SIGNAL_RE.search(clean) or ROS_SIGNAL_RE.search(clean):
+                continue
+        filtered.append(fact)
+    return filtered
+
+
 def _render_intro_items(note: TruthLayerNote) -> list[PresentationItem]:
     date_of_service = _first_value(note, "date_of_service")
     facility = _first_value(note, "facility")
@@ -603,7 +642,7 @@ def _render_intro_items(note: TruthLayerNote) -> list[PresentationItem]:
 
 
 def _render_field_items(note: TruthLayerNote, field_name: str) -> list[PresentationItem]:
-    facts = list(getattr(note, field_name))
+    facts = _filter_presentable_facts(field_name, list(getattr(note, field_name)))
     if not facts:
         return []
     if field_name == "residual_supported_facts":
@@ -636,7 +675,8 @@ def _render_field_items(note: TruthLayerNote, field_name: str) -> list[Presentat
 def _build_candidate_presentation_sections(notes: list[TruthLayerNote]) -> list[PresentationSection]:
     sections: list[PresentationSection] = []
     for index, note in enumerate(notes, start=1):
-        title = _first_value(note, "date_of_service") or f"Note {index}"
+        date_label = _first_value(note, "date_of_service")
+        title = f"On {date_label}" if date_label else f"Note {index}"
         items: list[PresentationItem] = []
         items.extend(_render_intro_items(note))
         for field_name in PRESENTATION_FIELD_ORDER:
@@ -663,6 +703,7 @@ def _presentation_from_sections(
 ) -> tuple[PresentationLayer, list[VerifiedSentence], str]:
     verified_sentences: list[VerifiedSentence] = []
     normalized_sections: list[PresentationSection] = []
+    paragraphs: list[str] = []
     for section in sections:
         items: list[PresentationItem] = []
         for item in section.items:
@@ -681,7 +722,10 @@ def _presentation_from_sections(
                 )
             )
         normalized_sections.append(section.model_copy(update={"items": items}))
-    narrative = " ".join(item.text for section in normalized_sections for item in section.items).strip()
+        paragraph = " ".join(item.text for item in items).strip()
+        if paragraph:
+            paragraphs.append(paragraph)
+    narrative = "\n\n".join(paragraphs).strip()
     return (
         PresentationLayer(
             title=scope.title,
@@ -692,7 +736,6 @@ def _presentation_from_sections(
         verified_sentences,
         narrative,
     )
-
 
 def _truth_layer_payload(notes: list[TruthLayerNote]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
@@ -743,11 +786,12 @@ def _rendered_sections_from_payload(
     *,
     candidate_sections: list[PresentationSection],
 ) -> list[PresentationSection]:
-    fact_index = {
-        item.item_id: item
-        for section in candidate_sections
-        for item in section.items
-    }
+    fact_index: dict[str, PresentationItem] = {}
+    for section in candidate_sections:
+        for item in section.items:
+            fact_index[item.item_id] = item
+            for fact_id in item.fact_ids or []:
+                fact_index.setdefault(fact_id, item)
     rendered_sections: list[PresentationSection] = []
     for section_index, row in enumerate(payload.get("sections", []), start=1):
         if not isinstance(row, dict):
@@ -761,14 +805,17 @@ def _rendered_sections_from_payload(
             if not isinstance(item_row, dict):
                 continue
             text = _ensure_sentence(str(item_row.get("text") or ""))
-            fact_ids = [
-                fact_id
-                for fact_id in item_row.get("fact_ids", [])
-                if isinstance(fact_id, str) and fact_id in fact_index
-            ]
-            if not text or not fact_ids:
+            requested_fact_ids = [fact_id for fact_id in item_row.get("fact_ids", []) if isinstance(fact_id, str) and fact_id in fact_index]
+            if not text or not requested_fact_ids:
                 continue
-            facts = [fact_index[fact_id] for fact_id in fact_ids]
+            seen_item_ids: set[str] = set()
+            facts: list[PresentationItem] = []
+            for fact_id in requested_fact_ids:
+                fact = fact_index[fact_id]
+                if fact.item_id in seen_item_ids:
+                    continue
+                seen_item_ids.add(fact.item_id)
+                facts.append(fact)
             evidence, candidate_filenames, pdf_ids, pages = _aggregate_items(facts)
             field_names = _dedupe_preserve_order([fact.field_name for fact in facts if fact.field_name])
             inferred_note_id = note_id or next((fact.note_id for fact in facts if fact.note_id), None)
@@ -778,7 +825,7 @@ def _rendered_sections_from_payload(
                     text=text,
                     field_name=field_names[0] if len(field_names) == 1 else None,
                     note_id=inferred_note_id,
-                    fact_ids=fact_ids,
+                    fact_ids=requested_fact_ids,
                     rendered_by_model=True,
                     evidence=evidence,
                     candidate_filenames=candidate_filenames,
@@ -805,16 +852,27 @@ async def render_presentation_layer(
     notes: list[TruthLayerNote],
     scope: SummaryScope,
     settings: AppSettings,
-) -> tuple[PresentationLayer, list[VerifiedSentence], str]:
+) -> tuple[PresentationLayer, PresentationLayer | None, PresentationLayer, list[VerifiedSentence], str]:
     candidate_sections = _build_candidate_presentation_sections(notes)
-    fallback_layer = _presentation_from_sections(
+    plan_layer, plan_verified_sentences, plan_narrative = _presentation_from_sections(
         scope=scope,
         sections=candidate_sections,
         rendered_by_model=False,
-        debug={"renderer": "deterministic_fallback"},
+        debug={"renderer": "deterministic_plan", "stage": "plan"},
     )
     if not candidate_sections:
-        return fallback_layer
+        final_plan = plan_layer.model_copy(
+            update={
+                "debug": {
+                    **dict(plan_layer.debug),
+                    "stage": "final",
+                    "editor": "deterministic_plan",
+                    "editor_fallback_reason": "no_candidate_sections",
+                }
+            }
+        )
+        return plan_layer, None, final_plan, plan_verified_sentences, plan_narrative
+
     prompt = build_presentation_layer_prompt(
         scope,
         truth_payload={"notes": _truth_layer_payload(notes)},
@@ -833,34 +891,87 @@ async def render_presentation_layer(
     payload = _extract_json_object(response_text) or {}
     rendered_sections = _rendered_sections_from_payload(payload, candidate_sections=candidate_sections)
     if not rendered_sections:
-        layer, verified_sentences, narrative = fallback_layer
-        return (
-            layer.model_copy(
-                update={
-                    "debug": {
-                        **dict(layer.debug),
-                        "renderer_prompt": prompt,
-                        "renderer_response": response_text,
-                        "renderer_payload": payload,
-                        "renderer_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in sources],
-                        "renderer": "deterministic_fallback",
-                        "renderer_fallback_reason": "empty_or_invalid_payload",
-                    },
+        final_plan = plan_layer.model_copy(
+            update={
+                "debug": {
+                    **dict(plan_layer.debug),
+                    "renderer_prompt": prompt,
+                    "renderer_response": response_text,
+                    "renderer_payload": payload,
+                    "renderer_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in sources],
+                    "renderer": "deterministic_plan",
+                    "stage": "final",
+                    "renderer_fallback_reason": "empty_or_invalid_draft",
                 }
-            ),
-            verified_sentences,
-            narrative,
+            }
         )
-    layer, verified_sentences, narrative = _presentation_from_sections(
+        return plan_layer, None, final_plan, plan_verified_sentences, plan_narrative
+
+    draft_layer, draft_verified_sentences, draft_narrative = _presentation_from_sections(
         scope=scope,
         sections=rendered_sections,
         rendered_by_model=True,
         debug={
-            "renderer": "llm",
+            "renderer": "llm_draft",
+            "stage": "draft",
             "renderer_prompt": prompt,
             "renderer_response": response_text,
             "renderer_payload": payload,
             "renderer_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in sources],
         },
     )
-    return layer, verified_sentences, narrative
+
+    editor_prompt = build_presentation_editor_prompt(
+        scope,
+        truth_payload={"notes": _truth_layer_payload(notes)},
+        draft_sections=_candidate_section_payload(draft_layer.sections),
+    )
+    editor_model = settings.editor_llm_model or settings.renderer_llm_model
+    editor_provider = settings.editor_llm_provider or settings.renderer_llm_provider
+    editor_data_sources = ["__fastpdf_openrag_editor_no_sources__"] if settings.editor_disable_retrieval else None
+    editor_response_text, editor_sources = await gateway.chat_on_sources(
+        message=editor_prompt,
+        data_sources=editor_data_sources,
+        limit=1,
+        score_threshold=0,
+        llm_model=editor_model,
+        llm_provider=editor_provider,
+        disable_retrieval=settings.editor_disable_retrieval,
+    )
+    editor_payload = _extract_json_object(editor_response_text) or {}
+    edited_sections = _rendered_sections_from_payload(editor_payload, candidate_sections=draft_layer.sections)
+    if not edited_sections:
+        final_draft = draft_layer.model_copy(
+            update={
+                "debug": {
+                    **dict(draft_layer.debug),
+                    "stage": "final",
+                    "editor": "draft_fallback",
+                    "editor_prompt": editor_prompt,
+                    "editor_response": editor_response_text,
+                    "editor_payload": editor_payload,
+                    "editor_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in editor_sources],
+                    "editor_fallback_reason": "empty_or_invalid_payload",
+                }
+            }
+        )
+        return plan_layer, draft_layer, final_draft, draft_verified_sentences, draft_narrative
+
+    final_layer, verified_sentences, narrative = _presentation_from_sections(
+        scope=scope,
+        sections=edited_sections,
+        rendered_by_model=True,
+        debug={
+            "renderer": "llm_editor",
+            "stage": "final",
+            "draft_renderer_prompt": prompt,
+            "draft_renderer_response": response_text,
+            "draft_renderer_payload": payload,
+            "draft_renderer_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in sources],
+            "editor_prompt": editor_prompt,
+            "editor_response": editor_response_text,
+            "editor_payload": editor_payload,
+            "editor_sources": [source.model_dump() if hasattr(source, "model_dump") else source for source in editor_sources],
+        },
+    )
+    return plan_layer, draft_layer, final_layer, verified_sentences, narrative

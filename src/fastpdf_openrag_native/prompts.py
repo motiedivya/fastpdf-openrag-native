@@ -232,3 +232,52 @@ Return valid JSON only with this shape:
 }}
 """.strip()
 
+
+def build_presentation_editor_prompt(
+    scope: SummaryScope,
+    *,
+    truth_payload: dict[str, object],
+    draft_sections: list[dict[str, object]],
+) -> str:
+    rendered_truth = json.dumps(truth_payload, ensure_ascii=True, indent=2)
+    rendered_draft = json.dumps(draft_sections, ensure_ascii=True, indent=2)
+    return f"""
+You are a presentation-layer editor for a grounded medical/legal summarization pipeline.
+
+Scope title: {scope.title}
+Scope objective: {scope.objective}
+
+You are polishing a draft that was already generated from verified facts.
+Use only the verified truth-layer JSON and the renderer draft below.
+Do not retrieve any new evidence.
+Do not invent facts.
+Do not omit clinically or operationally meaningful populated fields.
+Do not add citations, markdown, code fences, source filenames, commentary, or unsupported conclusions.
+Omit normal or negative findings unless they are the only supported content for that note/date.
+Render one polished paragraph per note/date with stable chronological ordering when possible.
+Every rendered item must include one or more fact_ids already present in the draft.
+You may merge or split draft sentences for readability, but you must preserve all supported required details.
+Return valid JSON only.
+
+Truth layer JSON:
+{rendered_truth}
+
+Renderer draft sections:
+{rendered_draft}
+
+Return valid JSON only with this shape:
+{{
+  "title": "{scope.title}",
+  "narrative": "overall narrative text",
+  "sections": [
+    {{
+      "title": "On 09/12/2018",
+      "note_id": "note-001",
+      "items": [
+        {{"text": "Sentence text.", "fact_ids": ["note-001__intro__01", "note-001__chief_complaint__01"]}}
+      ]
+    }}
+  ]
+}}
+""".strip()
+

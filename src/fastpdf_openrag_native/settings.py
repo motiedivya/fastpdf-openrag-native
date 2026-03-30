@@ -198,6 +198,18 @@ class AppSettings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_RENDERER_DISABLE_RETRIEVAL"),
     )
+    editor_llm_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_EDITOR_LLM_PROVIDER"),
+    )
+    editor_llm_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_EDITOR_LLM_MODEL"),
+    )
+    editor_disable_retrieval: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_EDITOR_DISABLE_RETRIEVAL"),
+    )
 
 
 @lru_cache(maxsize=1)

@@ -416,6 +416,8 @@ class ScopedSummaryResult(BaseModel):
     unsupported_sentences: list[str] = Field(default_factory=list)
     truth_layer: list[TruthLayerNote] = Field(default_factory=list)
     validation_layer: ValidationLayer | None = None
+    presentation_plan: PresentationLayer | None = None
+    presentation_draft: PresentationLayer | None = None
     presentation_layer: PresentationLayer | None = None
     citation_index: list[CitationIndexEntry] = Field(default_factory=list)
     citation_instances: list[CitationInstance] = Field(default_factory=list)
