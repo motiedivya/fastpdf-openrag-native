@@ -17,6 +17,7 @@ User request: {input}
 
 Use the OpenSearch Retrieval Tool whenever the request depends on indexed documents.
 Treat the knowledge filter as hard scope and do not ask the user to upload, paste, or re-ingest indexed content.
+When the user asks for structured JSON or machine-readable output, keep response fields clean. Do not place inline citations, source filenames, chunk ids, markdown, or `(Source: ...)` strings inside JSON values; citations are attached downstream.
 """
 
 

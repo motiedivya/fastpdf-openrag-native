@@ -7,7 +7,8 @@ This runbook is for this machine and this repository:
 - OpenRAG compose file: `~/.openrag/tui/docker-compose.yml`
 - Docling venv: `~/.openrag/docling-venv`
 - expected OpenRAG URL: `http://127.0.0.1:3000`
-- expected Docling URL: `http://127.0.0.1:5001`
+- expected Docling URL from the host: `http://127.0.0.1:5001`
+- required bind address for container access: `0.0.0.0:5001`
 
 OpenRAG references used for this runbook:
 
@@ -69,13 +70,13 @@ curl -fsS http://127.0.0.1:5001/health
 If it is not healthy, start it manually:
 
 ```bash
-"$HOME/.openrag/docling-venv/bin/docling-serve" run --host 127.0.0.1 --port 5001
+"$HOME/.openrag/docling-venv/bin/docling-serve" run --host 0.0.0.0 --port 5001
 ```
 
 If you want it in the background:
 
 ```bash
-nohup "$HOME/.openrag/docling-venv/bin/docling-serve" run --host 127.0.0.1 --port 5001 \
+nohup "$HOME/.openrag/docling-venv/bin/docling-serve" run --host 0.0.0.0 --port 5001 \
   >> "$HOME/.openrag/docling-serve.log" 2>&1 &
 echo $! > "$HOME/.openrag/tui/.docling.pid"
 ```
@@ -483,7 +484,7 @@ Restart it:
 
 ```bash
 pkill -f 'docling-serve run' || true
-nohup "$HOME/.openrag/docling-venv/bin/docling-serve" run --host 127.0.0.1 --port 5001 \
+nohup "$HOME/.openrag/docling-venv/bin/docling-serve" run --host 0.0.0.0 --port 5001 \
   >> "$HOME/.openrag/docling-serve.log" 2>&1 &
 ```
 

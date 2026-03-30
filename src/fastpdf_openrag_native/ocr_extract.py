@@ -23,10 +23,105 @@ def build_run_id(pdf_path: Path) -> str:
     return slugify_filename(pdf_path.stem.lower())
 
 
+OCR_CANONICAL_REPLACEMENTS = (
+    (re.compile(r"\b0TC\b", flags=re.IGNORECASE), "OTC"),
+    (re.compile(r"\bOTC\s+Alive\b", flags=re.IGNORECASE), "OTC Aleve"),
+    (re.compile(r"\bOTC\s+A1eve\b", flags=re.IGNORECASE), "OTC Aleve"),
+    (re.compile(r"\bD[0O]B\b", flags=re.IGNORECASE), "DOB"),
+    (re.compile(r"\bD[0O]S\b", flags=re.IGNORECASE), "DOS"),
+)
+OCR_NOISE_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"\bfrom\s+siliconmesa\b",
+        r"\bfax\s+(?:server|summary|from|to|number)\b",
+        r"\bpage\s+\d+\s+of\s+\d+\b",
+        r"\bconfidentiality\s+notice\b",
+        r"\bprinted\s+(?:by|on)\b",
+        r"https?://",
+        r"\bwww\.",
+    )
+)
+
+
+def _apply_ocr_replacements(text: str) -> str:
+    clean = text
+    for pattern, replacement in OCR_CANONICAL_REPLACEMENTS:
+        clean = pattern.sub(replacement, clean)
+    return clean
+
+
 def _normalize_text(text: str) -> str:
     clean = text.replace("\u00a0", " ")
-    clean = re.sub(r"\s+", " ", clean)
+    clean = clean.replace("\r\n", "\n").replace("\r", "\n")
+    clean = _apply_ocr_replacements(clean)
+    clean = re.sub(r"[ \t]+", " ", clean)
+    clean = re.sub(r"\s+([,.;:])", r"\1", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
     return clean.strip()
+
+
+def _ocr_dedupe_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _is_obvious_ocr_noise(text: str) -> bool:
+    clean = _normalize_text(text)
+    if not clean:
+        return True
+    if any(pattern.search(clean) for pattern in OCR_NOISE_PATTERNS):
+        return True
+    token_count = len(re.findall(r"[A-Za-z0-9]+", clean))
+    alpha_count = sum(char.isalpha() for char in clean)
+    digit_count = sum(char.isdigit() for char in clean)
+    if token_count <= 2 and digit_count >= 4:
+        return True
+    if alpha_count < 4 and digit_count >= 4 and len(clean) < 36:
+        return True
+    if re.fullmatch(r"(?:page|pg)\s*\d+(?:\s+of\s+\d+)?", clean, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _prepare_paragraphs_for_indexing(paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    previous_key = ""
+    for paragraph in paragraphs:
+        clean_text = _normalize_text(str(paragraph.get("text") or ""))
+        if not clean_text:
+            continue
+        dedupe_key = _ocr_dedupe_key(clean_text)
+        if dedupe_key and dedupe_key == previous_key:
+            continue
+        if _is_obvious_ocr_noise(clean_text):
+            continue
+        normalized = dict(paragraph)
+        normalized["text"] = clean_text
+        prepared.append(normalized)
+        previous_key = dedupe_key
+    return prepared
+
+
+def _build_indexable_full_text(paragraphs: list[dict[str, Any]], fallback_text: str) -> str:
+    if paragraphs:
+        return "\n\n".join(
+            str(paragraph.get("text") or "").strip()
+            for paragraph in paragraphs
+            if str(paragraph.get("text") or "").strip()
+        ).strip()
+
+    lines: list[str] = []
+    previous_key = ""
+    for raw_line in re.split(r"\n+", _normalize_text(fallback_text)):
+        clean_line = _normalize_text(raw_line)
+        if not clean_line or _is_obvious_ocr_noise(clean_line):
+            continue
+        dedupe_key = _ocr_dedupe_key(clean_line)
+        if dedupe_key and dedupe_key == previous_key:
+            continue
+        lines.append(clean_line)
+        previous_key = dedupe_key
+    return "\n".join(lines).strip() or _normalize_text(fallback_text)
 
 
 def _bbox_from_vertices(vertices: list[Any]) -> tuple[int, int, int, int]:
@@ -52,6 +147,7 @@ def _paragraph_text(paragraph: Any) -> str:
 
 def _page_paragraphs(page_annotation: Any) -> list[dict[str, Any]]:
     paragraphs: list[dict[str, Any]] = []
+    page_paragraph_index = 1
     for block_index, block in enumerate(page_annotation.blocks, start=1):
         for paragraph_index, paragraph in enumerate(block.paragraphs, start=1):
             text = _paragraph_text(paragraph)
@@ -62,6 +158,7 @@ def _page_paragraphs(page_annotation: Any) -> list[dict[str, Any]]:
                 {
                     "block_index": block_index,
                     "paragraph_index": paragraph_index,
+                    "page_paragraph_index": page_paragraph_index,
                     "text": text,
                     "bbox": {
                         "left": left,
@@ -73,6 +170,7 @@ def _page_paragraphs(page_annotation: Any) -> list[dict[str, Any]]:
                     },
                 }
             )
+            page_paragraph_index += 1
     return paragraphs
 
 
@@ -94,6 +192,7 @@ def build_html_document(
                 "<p "
                 f"data-block=\"{item['block_index']}\" "
                 f"data-paragraph=\"{item['paragraph_index']}\" "
+                f"data-page-paragraph=\"{item.get('page_paragraph_index', 0)}\" "
                 f"data-left=\"{bbox['left']}\" "
                 f"data-top=\"{bbox['top']}\" "
                 f"data-width=\"{bbox['width']}\" "
@@ -253,7 +352,8 @@ def extract_pdf_to_html(
         annotation_pages = list(full_text_annotation.pages)
         page_annotation = annotation_pages[0] if annotation_pages else None
         paragraphs = _page_paragraphs(page_annotation) if page_annotation else []
-        full_text = _normalize_text(full_text_annotation.text or "")
+        index_paragraphs = _prepare_paragraphs_for_indexing(paragraphs)
+        full_text = _build_indexable_full_text(index_paragraphs or paragraphs, full_text_annotation.text or "")
 
         text_path = artifacts_dir / f"{run_id}__p{page_number:04d}.txt"
         text_path.write_text(full_text, encoding="utf-8")
@@ -273,7 +373,7 @@ def extract_pdf_to_html(
             encoding="utf-8",
         )
 
-        blocks = blocks_from_ocr_paragraphs(paragraphs) or text_to_blocks(
+        blocks = blocks_from_ocr_paragraphs(index_paragraphs) or text_to_blocks(
             full_text,
             target_chars=effective_settings.structure_chunk_target_chars,
         )
@@ -348,6 +448,7 @@ def extract_pdf_to_html(
                 "text_path": text_path.as_posix(),
                 "raw_json_path": raw_json_path.as_posix(),
                 "paragraph_count": len(paragraphs),
+                "indexed_paragraph_count": len(index_paragraphs),
             },
             metrics={"text_length": len(full_text)},
             output_files=[raw_json_path.as_posix(), text_path.as_posix()],
@@ -379,6 +480,8 @@ def extract_pdf_to_html(
                     "page_width": pix.width,
                     "page_height": pix.height,
                     "paragraph_count": len(paragraphs),
+                    "indexed_paragraph_count": len(index_paragraphs),
+                    "removed_noise_paragraph_count": max(0, len(paragraphs) - len(index_paragraphs)),
                     "ocr_provider": "google_vision_document_text_detection",
                 },
             )

@@ -119,6 +119,10 @@ class AppSettings(BaseSettings):
         default=3,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_VERIFICATION_LIMIT"),
     )
+    verification_concurrency: int = Field(
+        default=2,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_VERIFICATION_CONCURRENCY"),
+    )
     verification_score_threshold: float = Field(
         default=0.15,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_VERIFICATION_SCORE_THRESHOLD"),

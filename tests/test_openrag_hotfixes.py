@@ -138,6 +138,9 @@ def test_extract_sources_tolerates_none_results(monkeypatch):
             "score": 1.25,
             "page": 3,
             "mimetype": None,
+            "base_score": None,
+            "rerank_score": None,
+            "retrieval_rank": None,
         }
     ]
 
@@ -182,8 +185,197 @@ def test_recover_history_context_skips_none_items_and_results(monkeypatch):
             "score": 2.75,
             "page": 1,
             "mimetype": "text/html",
+            "base_score": None,
+            "rerank_score": None,
+            "retrieval_rank": None,
         }
     ]
+
+
+def test_chat_endpoint_skips_prompt_backfill_when_sources_are_already_scored(monkeypatch):
+    module = _load_chat_hotfix(monkeypatch, history_messages=[])
+
+    class FakeChatService:
+        async def langflow_chat(  # noqa: ANN001
+            self,
+            *,
+            prompt,
+            user_id,
+            jwt_token,
+            previous_response_id,
+            stream,
+            filter_id,
+        ):
+            return {
+                "response": "ok",
+                "response_id": "chat-1",
+                "sources": [
+                    {
+                        "filename": "doc.html",
+                        "text": "grounded answer",
+                        "score": 0.91,
+                        "page": 1,
+                        "mimetype": "text/html",
+                        "base_score": 0.91,
+                        "rerank_score": 0.91,
+                        "retrieval_rank": 1,
+                    }
+                ],
+            }
+
+    class FakeSearchService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def search(self, query, user_id=None, jwt_token=None, filters=None, limit=10, score_threshold=0):  # noqa: ANN001
+            self.calls.append(query)
+            return {"results": []}
+
+    search_service = FakeSearchService()
+    user = types.SimpleNamespace(user_id="user-1", jwt_token="jwt-1")
+    body = module.ChatV1Body(message="Summarize the operative note.", limit=6)
+
+    response = asyncio.run(
+        module.chat_create_endpoint(
+            body,
+            chat_service=FakeChatService(),
+            search_service=search_service,
+            session_manager=None,
+            user=user,
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert search_service.calls == []
+    assert payload["sources"][0]["score"] == 0.91
+
+
+def test_chat_endpoint_backfills_rerank_metadata_when_chat_sources_lack_it(monkeypatch):
+    module = _load_chat_hotfix(
+        monkeypatch,
+        history_messages=[
+            {
+                "role": "assistant",
+                "chunks": [
+                    {"item": {"inputs": {"search_query": "operative detail"}, "results": None}}
+                ],
+            }
+        ],
+    )
+
+    class FakeChatService:
+        async def langflow_chat(  # noqa: ANN001
+            self,
+            *,
+            prompt,
+            user_id,
+            jwt_token,
+            previous_response_id,
+            stream,
+            filter_id,
+        ):
+            return {
+                "response": "ok",
+                "response_id": "chat-1",
+                "sources": [
+                    {
+                        "filename": "doc.html",
+                        "text": "grounded answer",
+                        "score": 0.91,
+                        "page": 1,
+                        "mimetype": "text/html",
+                    }
+                ],
+            }
+
+    class FakeSearchService:
+        async def search(self, query, user_id=None, jwt_token=None, filters=None, limit=10, score_threshold=0):  # noqa: ANN001
+            return {
+                "results": [
+                    {
+                        "filename": "doc.html",
+                        "text": "grounded answer",
+                        "score": 0.91,
+                        "page": 1,
+                        "mimetype": "text/html",
+                    }
+                ]
+            }
+
+    user = types.SimpleNamespace(user_id="user-1", jwt_token="jwt-1")
+    body = module.ChatV1Body(message="Summarize the operative note.", limit=6)
+
+    response = asyncio.run(
+        module.chat_create_endpoint(
+            body,
+            chat_service=FakeChatService(),
+            search_service=FakeSearchService(),
+            session_manager=None,
+            user=user,
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert payload["sources"][0]["score"] == 0.91
+    assert payload["sources"][0]["base_score"] == 0.91
+    assert payload["sources"][0]["rerank_score"] == 0.91
+    assert payload["sources"][0]["retrieval_rank"] == 1
+
+
+def test_chat_endpoint_filters_sources_to_allowed_data_sources(monkeypatch):
+    module = _load_chat_hotfix(monkeypatch, history_messages=[])
+
+    class FakeChatService:
+        async def langflow_chat(  # noqa: ANN001
+            self,
+            *,
+            prompt,
+            user_id,
+            jwt_token,
+            previous_response_id,
+            stream,
+            filter_id,
+        ):
+            return {
+                "response": "ok",
+                "response_id": "chat-1",
+                "sources": [
+                    {
+                        "filename": "allowed.md",
+                        "text": "current run evidence",
+                        "score": 0.91,
+                        "page": 1,
+                        "mimetype": "text/markdown",
+                    },
+                    {
+                        "filename": "stale.md",
+                        "text": "stale run evidence",
+                        "score": 0.99,
+                        "page": 9,
+                        "mimetype": "text/markdown",
+                    },
+                ],
+            }
+
+    user = types.SimpleNamespace(user_id="user-1", jwt_token="jwt-1")
+    body = module.ChatV1Body(
+        message="Summarize the operative note.",
+        filters={"data_sources": ["allowed.md"]},
+        limit=6,
+    )
+
+    response = asyncio.run(
+        module.chat_create_endpoint(
+            body,
+            chat_service=FakeChatService(),
+            search_service=types.SimpleNamespace(search=None),
+            session_manager=None,
+            user=user,
+        )
+    )
+    payload = json.loads(response.body)
+
+    assert [source["filename"] for source in payload["sources"]] == ["allowed.md"]
 
 
 def test_search_hotfix_reranks_public_results_and_expands_candidate_pool(monkeypatch):
@@ -226,7 +418,11 @@ def test_search_hotfix_reranks_public_results_and_expands_candidate_pool(monkeyp
 
     search_service = FakeSearchService()
     user = types.SimpleNamespace(user_id="user-1")
-    body = module.SearchV1Body(query="operative detail", limit=1, filters={"data_sources": ["doc.md"]})
+    body = module.SearchV1Body(
+        query="operative detail",
+        limit=1,
+        filters={"data_sources": ["header.md", "procedure.md"]},
+    )
 
     response = asyncio.run(
         module.search_endpoint(body, search_service=search_service, user=user)
@@ -237,3 +433,38 @@ def test_search_hotfix_reranks_public_results_and_expands_candidate_pool(monkeyp
     assert payload["results"][0]["filename"] == "procedure.md"
     assert payload["results"][0]["base_score"] == 0.35
     assert payload["results"][0]["retrieval_rank"] == 1
+
+
+def test_search_hotfix_filters_results_to_allowed_data_sources(monkeypatch):
+    module = _load_search_hotfix(monkeypatch)
+
+    class FakeSearchService:
+        async def search(self, query, user_id=None, jwt_token=None, filters=None, limit=10, score_threshold=0):  # noqa: ANN001
+            return {
+                "results": [
+                    {
+                        "filename": "allowed.md",
+                        "text": "current run evidence",
+                        "score": 0.7,
+                        "page": 1,
+                        "mimetype": "text/markdown",
+                    },
+                    {
+                        "filename": "stale.md",
+                        "text": "stale evidence",
+                        "score": 0.95,
+                        "page": 9,
+                        "mimetype": "text/markdown",
+                    },
+                ]
+            }
+
+    user = types.SimpleNamespace(user_id="user-1")
+    body = module.SearchV1Body(query="evidence", limit=5, filters={"data_sources": ["allowed.md"]})
+
+    response = asyncio.run(
+        module.search_endpoint(body, search_service=FakeSearchService(), user=user)
+    )
+    payload = json.loads(response.body)
+
+    assert [row["filename"] for row in payload["results"]] == ["allowed.md"]

@@ -12,6 +12,7 @@ from .models import (
     PdfPipelineResult,
     SummaryScope,
 )
+from .citations import ensure_summary_citations
 from .ocr_extract import extract_pdf_to_html, slugify_filename
 from .openrag import OpenRAGGateway
 from .opensearch import OpenSearchInspector
@@ -293,6 +294,9 @@ async def run_pdf_pipeline(
     summary = None
     summary_path = None
     summary_error = None
+    citation_index_path = None
+    resolved_citations_path = None
+    source_pdf_copy_path = None
     try:
         summary = await summarize_scope(
             gateway,
@@ -301,17 +305,64 @@ async def run_pdf_pipeline(
             settings=effective_settings,
         )
         summary_path = summary_dir / "all-pages.summary.json"
-        summary_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+        try:
+            (
+                summary,
+                citation_index_path,
+                resolved_citations_path,
+                source_pdf_copy_path,
+            ) = ensure_summary_citations(
+                summary_path=summary_path,
+                manifest_path=manifest_path,
+                source_pdf=pdf_path,
+                summary=summary,
+                manifest=manifest,
+            )
+            trace.record(
+                stage="citations",
+                service="fastpdf-openrag-native",
+                action="build_summary_citations",
+                response={
+                    "citation_index_path": citation_index_path.as_posix(),
+                    "resolved_citations_path": resolved_citations_path.as_posix(),
+                    "citation_count": len(summary.citation_index),
+                    "section_count": len(summary.resolved_citations.sections) if summary.resolved_citations else 0,
+                    "source_pdf_copy_path": source_pdf_copy_path.as_posix() if source_pdf_copy_path else None,
+                },
+                output_files=[
+                    citation_index_path.as_posix(),
+                    resolved_citations_path.as_posix(),
+                    *([source_pdf_copy_path.as_posix()] if source_pdf_copy_path else []),
+                ],
+            )
+        except Exception as exc:
+            summary_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+            trace.record(
+                stage="citations",
+                service="fastpdf-openrag-native",
+                action="build_summary_citations",
+                status="error",
+                response={"error": str(exc)},
+                notes=[
+                    "Summary succeeded but citation artifacts could not be generated. The summary route can retry citation backfill later."
+                ],
+            )
         trace.record(
             stage="summary",
             service="openrag",
             action="summarize_scope",
             response={
                 "summary_path": summary_path.as_posix(),
+                "citation_index_path": citation_index_path.as_posix() if citation_index_path else None,
+                "resolved_citations_path": resolved_citations_path.as_posix() if resolved_citations_path else None,
                 "page_summary_count": len(summary.page_summaries),
                 "unsupported_sentences": summary.unsupported_sentences,
             },
-            output_files=[summary_path.as_posix()],
+            output_files=[
+                summary_path.as_posix(),
+                *([citation_index_path.as_posix()] if citation_index_path else []),
+                *([resolved_citations_path.as_posix()] if resolved_citations_path else []),
+            ],
         )
     except Exception as exc:
         summary_error = str(exc)
@@ -436,6 +487,9 @@ async def run_pdf_pipeline(
         requested_max_pages=manifest.requested_max_pages,
         is_partial_run=manifest.is_partial_run,
         summary_path=summary_path.as_posix() if summary_path else None,
+        citation_index_path=citation_index_path.as_posix() if citation_index_path else None,
+        resolved_citations_path=resolved_citations_path.as_posix() if resolved_citations_path else None,
+        source_pdf_copy_path=source_pdf_copy_path.as_posix() if source_pdf_copy_path else None,
         summary=summary,
         summary_error=summary_error,
         ingestion_results=ingestion_results,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from openrag_sdk import OpenRAGClient, OpenRAGError
 
@@ -76,6 +77,55 @@ class OpenRAGGateway:
             base_url=self.settings.openrag_url,
             timeout=120.0,
         )
+
+    @staticmethod
+    def _filter_allowed_sources(
+        sources: list[EvidenceHit],
+        *,
+        data_sources: list[str] | None,
+    ) -> list[EvidenceHit]:
+        allowed_sources = {source for source in data_sources or [] if source}
+        if not allowed_sources:
+            return list(sources)
+        return [source for source in sources if source.filename in allowed_sources]
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _coerce_evidence_hits(cls, rows: list[Any] | None) -> list[EvidenceHit]:
+        hits: list[EvidenceHit] = []
+        for row in rows or []:
+            if hasattr(row, "model_dump"):
+                row = row.model_dump()
+            if not isinstance(row, dict):
+                continue
+            hits.append(
+                EvidenceHit(
+                    filename=str(row.get("filename") or ""),
+                    text=str(row.get("text") or ""),
+                    score=cls._coerce_float(row.get("score")),
+                    page=cls._coerce_int(row.get("page")),
+                    mimetype=(str(row.get("mimetype")) if row.get("mimetype") is not None else None),
+                    base_score=(cls._coerce_float(row.get("base_score")) if row.get("base_score") is not None else None),
+                    rerank_score=(cls._coerce_float(row.get("rerank_score")) if row.get("rerank_score") is not None else None),
+                    retrieval_rank=cls._coerce_int(row.get("retrieval_rank")),
+                )
+            )
+        return hits
 
     async def health(self) -> dict[str, object]:
         async with self._client() as client:
@@ -175,18 +225,22 @@ class OpenRAGGateway:
                 "data_sources": data_sources,
                 "document_types": document_types or ["text/markdown", "text/html"],
             }
+        body: dict[str, Any] = {
+            "message": message,
+            "stream": False,
+            "limit": limit,
+            "score_threshold": score_threshold,
+        }
+        if filters:
+            body["filters"] = filters
+        if filter_id:
+            body["filter_id"] = filter_id
         async with self._client() as client:
-            response = await client.chat.create(
-                message=message,
-                filters=filters,
-                limit=limit,
-                score_threshold=score_threshold,
-                filter_id=filter_id,
-            )
-        allowed_sources = set(data_sources or [])
-        sources = [EvidenceHit(**source.model_dump()) for source in response.sources]
-        filtered_sources = [source for source in sources if source.filename in allowed_sources] if allowed_sources else sources
-        return response.response, filtered_sources or sources
+            response = await client._request("POST", "/api/v1/chat", json=body)
+        data = response.json()
+        sources = self._coerce_evidence_hits(data.get("sources", []))
+        filtered_sources = self._filter_allowed_sources(sources, data_sources=data_sources)
+        return str(data.get("response") or ""), filtered_sources
 
     async def search_on_sources(
         self,
@@ -204,19 +258,24 @@ class OpenRAGGateway:
                 "data_sources": data_sources,
                 "document_types": document_types or ["text/markdown", "text/html"],
             }
+        body: dict[str, Any] = {
+            "query": query,
+            "limit": limit if limit is not None else self.settings.verification_limit,
+            "score_threshold": (
+                score_threshold
+                if score_threshold is not None
+                else self.settings.verification_score_threshold
+            ),
+        }
+        if filters:
+            body["filters"] = filters
+        if filter_id:
+            body["filter_id"] = filter_id
         async with self._client() as client:
-            response = await client.search.query(
-                query,
-                filters=filters,
-                limit=limit if limit is not None else self.settings.verification_limit,
-                score_threshold=(
-                    score_threshold
-                    if score_threshold is not None
-                    else self.settings.verification_score_threshold
-                ),
-                filter_id=filter_id,
-            )
-        return [EvidenceHit(**row.model_dump()) for row in response.results]
+            response = await client._request("POST", "/api/v1/search", json=body)
+        data = response.json()
+        results = self._coerce_evidence_hits(data.get("results", []))
+        return self._filter_allowed_sources(results, data_sources=data_sources)
 
     async def upsert_scope_filter(
         self,

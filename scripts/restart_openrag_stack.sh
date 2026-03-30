@@ -8,6 +8,9 @@ OPENRAG_OVERRIDE_FILE="${OPENRAG_OVERRIDE_FILE:-$REPO_ROOT/docker/openrag-overri
 DOCLING_BIN="${DOCLING_BIN:-$HOME/.openrag/docling-venv/bin/docling-serve}"
 DOCLING_LOG="${DOCLING_LOG:-$HOME/.openrag/docling-serve.log}"
 DOCLING_PID_FILE="${DOCLING_PID_FILE:-$HOME/.openrag/tui/.docling.pid}"
+DOCLING_HOST="${DOCLING_HOST:-0.0.0.0}"
+DOCLING_PORT="${DOCLING_PORT:-5001}"
+DOCLING_HEALTH_URL="${DOCLING_HEALTH_URL:-http://127.0.0.1:${DOCLING_PORT}/health}"
 
 export FASTPDF_OPENRAG_NATIVE_ROOT="${FASTPDF_OPENRAG_NATIVE_ROOT:-$REPO_ROOT}"
 export FASTPDF_OPENRAG_BACKEND_RERANK_ENABLED="${FASTPDF_OPENRAG_BACKEND_RERANK_ENABLED:-true}"
@@ -16,6 +19,11 @@ export FASTPDF_OPENRAG_BACKEND_RERANK_MODEL="${FASTPDF_OPENRAG_BACKEND_RERANK_MO
 export FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N="${FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N:-8}"
 export FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED="${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED:-true}"
 export FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT="${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT:-24}"
+export FASTPDF_OPENRAG_RESTART_UI="${FASTPDF_OPENRAG_RESTART_UI:-true}"
+export FASTPDF_OPENRAG_UI_HOST="${FASTPDF_OPENRAG_UI_HOST:-127.0.0.1}"
+export FASTPDF_OPENRAG_UI_PORT="${FASTPDF_OPENRAG_UI_PORT:-8077}"
+FASTPDF_UI_LOG="${FASTPDF_UI_LOG:-$REPO_ROOT/outputs/serve-ui.log}"
+FASTPDF_UI_PID_FILE="${FASTPDF_UI_PID_FILE:-$REPO_ROOT/outputs/serve-ui.pid}"
 
 if [[ ! -f "$OPENRAG_COMPOSE_FILE" ]]; then
   printf '[error] OpenRAG compose file not found: %s\n' "$OPENRAG_COMPOSE_FILE" >&2
@@ -65,10 +73,37 @@ restart_docling() {
     return 0
   fi
 
-  pkill -f 'docling-serve run --host 127.0.0.1 --port 5001' >/dev/null 2>&1 || true
-  nohup "$DOCLING_BIN" run --host 127.0.0.1 --port 5001 >>"$DOCLING_LOG" 2>&1 &
+  if [[ -f "$DOCLING_PID_FILE" ]]; then
+    kill "$(cat "$DOCLING_PID_FILE")" >/dev/null 2>&1 || true
+  fi
+  pkill -f "docling-serve run --host .* --port ${DOCLING_PORT}" >/dev/null 2>&1 || true
+  nohup "$DOCLING_BIN" run --host "$DOCLING_HOST" --port "$DOCLING_PORT" >>"$DOCLING_LOG" 2>&1 &
   echo $! >"$DOCLING_PID_FILE"
-  printf '[ok] restarted docling: pid=%s log=%s\n' "$(cat "$DOCLING_PID_FILE")" "$DOCLING_LOG"
+  printf '[ok] restarted docling: pid=%s host=%s port=%s log=%s\n' \
+    "$(cat "$DOCLING_PID_FILE")" "$DOCLING_HOST" "$DOCLING_PORT" "$DOCLING_LOG"
+}
+
+restart_fastpdf_ui() {
+  local restart_ui
+  restart_ui="$(printf '%s' "$FASTPDF_OPENRAG_RESTART_UI" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$restart_ui" == "0" || "$restart_ui" == "false" || "$restart_ui" == "no" || "$restart_ui" == "off" ]]; then
+    printf '[info] skipping fastpdf ui restart\n'
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$FASTPDF_UI_LOG")"
+  pkill -f 'fastpdf-openrag-native serve-ui' >/dev/null 2>&1 || true
+
+  (
+    cd "$REPO_ROOT"
+    nohup uv run fastpdf-openrag-native serve-ui \
+      --host "$FASTPDF_OPENRAG_UI_HOST" \
+      --port "$FASTPDF_OPENRAG_UI_PORT" >>"$FASTPDF_UI_LOG" 2>&1 &
+    echo $! >"$FASTPDF_UI_PID_FILE"
+  )
+
+  printf '[ok] restarted fastpdf ui: pid=%s log=%s\n' "$(cat "$FASTPDF_UI_PID_FILE")" "$FASTPDF_UI_LOG"
+  wait_for_http "http://$FASTPDF_OPENRAG_UI_HOST:$FASTPDF_OPENRAG_UI_PORT/" "FastPDF UI" 60 1
 }
 
 apply_recommended_settings() {
@@ -97,7 +132,7 @@ restart_docling
 
 compose up -d --no-build --force-recreate opensearch dashboards langflow openrag-backend openrag-frontend
 
-wait_for_http "http://127.0.0.1:5001/health" "Docling"
+wait_for_http "$DOCLING_HEALTH_URL" "Docling"
 wait_for_http "http://127.0.0.1:3000/api/settings" "OpenRAG"
 
 (
@@ -111,3 +146,5 @@ apply_recommended_settings
   cd "$REPO_ROOT"
   uv run fastpdf-openrag-native diagnose-stack
 )
+
+restart_fastpdf_ui

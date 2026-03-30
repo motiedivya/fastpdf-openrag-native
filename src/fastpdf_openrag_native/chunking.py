@@ -82,6 +82,7 @@ def blocks_from_ocr_paragraphs(paragraphs: list[dict[str, Any]]) -> list[Structu
         metadata = {
             "block_index": paragraph.get("block_index"),
             "paragraph_index": paragraph.get("paragraph_index"),
+            "page_paragraph_index": paragraph.get("page_paragraph_index"),
             "bbox": paragraph.get("bbox") or {},
         }
         blocks.append(StructuredBlock(text=text, metadata=metadata))
@@ -137,6 +138,9 @@ def _metadata_range(blocks: list[StructuredBlock]) -> dict[str, Any]:
     paragraph_indexes = [
         value for value in (block.metadata.get("paragraph_index") for block in blocks) if isinstance(value, int)
     ]
+    page_paragraph_indexes = [
+        value for value in (block.metadata.get("page_paragraph_index") for block in blocks) if isinstance(value, int)
+    ]
     metadata: dict[str, Any] = {"block_count": len(blocks)}
     if block_indexes:
         metadata["block_start"] = min(block_indexes)
@@ -144,6 +148,31 @@ def _metadata_range(blocks: list[StructuredBlock]) -> dict[str, Any]:
     if paragraph_indexes:
         metadata["paragraph_start"] = min(paragraph_indexes)
         metadata["paragraph_end"] = max(paragraph_indexes)
+    if page_paragraph_indexes:
+        metadata["page_paragraph_start"] = min(page_paragraph_indexes)
+        metadata["page_paragraph_end"] = max(page_paragraph_indexes)
+
+    paragraph_refs: list[dict[str, int]] = []
+    seen_refs: set[tuple[int, int, int | None]] = set()
+    for block in blocks:
+        block_index = block.metadata.get("block_index")
+        paragraph_index = block.metadata.get("paragraph_index")
+        page_paragraph_index = block.metadata.get("page_paragraph_index")
+        if not isinstance(block_index, int) or not isinstance(paragraph_index, int):
+            continue
+        ref_key = (block_index, paragraph_index, page_paragraph_index if isinstance(page_paragraph_index, int) else None)
+        if ref_key in seen_refs:
+            continue
+        seen_refs.add(ref_key)
+        ref = {
+            "block_index": block_index,
+            "paragraph_index": paragraph_index,
+        }
+        if isinstance(page_paragraph_index, int):
+            ref["page_paragraph_index"] = page_paragraph_index
+        paragraph_refs.append(ref)
+    if paragraph_refs:
+        metadata["paragraph_refs"] = paragraph_refs
     return metadata
 
 
@@ -276,6 +305,14 @@ def render_retrieval_markdown(
     ):
         metadata_lines.append(
             f"- OCR paragraph span: {chunk.metadata['paragraph_start']} to {chunk.metadata['paragraph_end']}"
+        )
+    if (
+        chunk.metadata.get("page_paragraph_start") is not None
+        and chunk.metadata.get("page_paragraph_end") is not None
+    ):
+        metadata_lines.append(
+            "- OCR page paragraph span: "
+            f"{chunk.metadata['page_paragraph_start']} to {chunk.metadata['page_paragraph_end']}"
         )
 
     body_lines: list[str] = []

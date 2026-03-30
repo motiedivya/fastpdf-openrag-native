@@ -47,6 +47,34 @@ STOPWORDS = {
     "to",
     "with",
 }
+HIGH_VALUE_TERMS = (
+    "subjective",
+    "assessment",
+    "plan",
+    "care plan",
+    "chief complaint",
+    "history of present illness",
+    "procedure",
+    "operation performed",
+    "indication for procedure",
+    "diagnosis",
+    "impression",
+    "follow-up",
+)
+LOW_VALUE_TERMS = (
+    "fax",
+    "phone",
+    "email",
+    "address",
+    "insurance",
+    "member id",
+    "guarantor",
+    "dob",
+    "pid",
+    "printed by",
+    "confidential",
+    "page ",
+)
 
 
 class SearchV1Body(BaseModel):
@@ -72,6 +100,20 @@ def _candidate_limit(requested_limit: int) -> int:
     return max(1, max(requested_limit, configured))
 
 
+def _allowed_source_names(filters: Optional[Dict[str, Any]]) -> set[str]:
+    data_sources = filters.get("data_sources") if isinstance(filters, dict) else None
+    if not isinstance(data_sources, list):
+        return set()
+    return {str(item).strip() for item in data_sources if str(item).strip()}
+
+
+def _filter_allowed_results(results: list[dict[str, Any]], filters: Optional[Dict[str, Any]]) -> list[dict[str, Any]]:
+    allowed_sources = _allowed_source_names(filters)
+    if not allowed_sources:
+        return list(results)
+    return [row for row in results if str(row.get("filename") or "").strip() in allowed_sources]
+
+
 def _normalize_text(value: str) -> str:
     clean = (value or "").lower()
     clean = clean.replace("\u00a0", " ")
@@ -85,6 +127,17 @@ def _tokenize(value: str) -> list[str]:
         for token in TOKEN_RE.findall(_normalize_text(value))
         if token not in STOPWORDS and len(token) > 1
     ]
+
+
+def _role_signal(value: str) -> tuple[float, float]:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return 0.0, 0.0
+    high_value = 1.0 if any(term in normalized for term in HIGH_VALUE_TERMS) else 0.0
+    low_value = 1.0 if any(term in normalized for term in LOW_VALUE_TERMS) else 0.0
+    if high_value and low_value:
+        low_value *= 0.35
+    return high_value, low_value
 
 
 def _attach_rank_metadata(
@@ -158,12 +211,15 @@ def _rerank_results(
             else 0.0
         )
         normalized_base = (base_score / max_base_score) if max_base_score > 0 else 0.0
+        high_value_signal, low_value_signal = _role_signal(normalized_text)
         rerank_score = (
-            0.35 * normalized_base
+            0.31 * normalized_base
             + 0.25 * idf_overlap
             + 0.15 * coverage
-            + 0.20 * max(phrase_match, bigram_match)
+            + 0.18 * max(phrase_match, bigram_match)
             + 0.05 * lead_overlap
+            + 0.10 * high_value_signal
+            - 0.08 * low_value_signal
         )
         enriched = dict(row)
         enriched["base_score"] = base_score
@@ -219,7 +275,7 @@ async def search_endpoint(
             score_threshold=body.score_threshold,
         )
 
-        raw_results = [
+        raw_results = _filter_allowed_results([
             {
                 "filename": item.get("filename"),
                 "text": item.get("text"),
@@ -231,7 +287,7 @@ async def search_endpoint(
                 "retrieval_rank": item.get("retrieval_rank"),
             }
             for item in result.get("results", [])
-        ]
+        ], body.filters)
         results = (
             _rerank_results(query=query, results=raw_results, requested_limit=requested_limit)
             if rerank_active

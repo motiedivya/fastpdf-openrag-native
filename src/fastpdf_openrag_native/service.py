@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .citations import ensure_summary_citations
 from .fastpdf_loader import load_run_from_mongo, load_run_json, materialize_summary_payload
 from .langflow import LangflowGateway
 from .openrag import OpenRAGGateway
@@ -120,6 +121,9 @@ def _job_debug_artifacts(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         "artifacts_dir": artifacts_dir,
         "trace_dir": trace_dir,
         "chunk_dump_dir": payload.get("chunk_dump_dir"),
+        "citation_index": payload.get("citation_index_path"),
+        "resolved_citations": payload.get("resolved_citations_path"),
+        "source_pdf_copy": payload.get("source_pdf_copy_path"),
     }
 
     artifact_links: dict[str, dict[str, str]] = {}
@@ -183,6 +187,9 @@ async def _run_job(
         chunk_dump_dir=result.chunk_dump_dir,
         manifest_path=result.manifest_path,
         summary_path=result.summary_path,
+        citation_index_path=result.citation_index_path,
+        resolved_citations_path=result.resolved_citations_path,
+        source_pdf_copy_path=result.source_pdf_copy_path,
         summary_error=result.summary_error,
         debug_artifacts=_job_debug_artifacts(result.model_dump(mode="json")),
     )
@@ -193,7 +200,7 @@ def _render_home() -> str:
     job_rows = "\n".join(
         (
             "<tr>"
-            f"<td><a href=\"/ui/runs/{html.escape(row['job_id'])}/trace\">{html.escape(row['job_id'])}</a></td>"
+            f"<td><a href=\"/ui/runs/{html.escape(row['job_id'])}/summary\">{html.escape(row['job_id'])}</a><br /><small><a href=\"/ui/runs/{html.escape(row['job_id'])}/trace\">Trace</a></small></td>"
             f"<td>{html.escape(str(row.get('status', 'unknown')))}</td>"
             f"<td>{html.escape(str(row.get('pdf_path', '')))}</td>"
             f"<td>{html.escape(str(row.get('run_id', '')))}</td>"
@@ -260,7 +267,11 @@ def _render_home() -> str:
         const response = await fetch(`/ui/runs/${{jobId}}`);
         const payload = await response.json();
         document.getElementById('status-box').textContent = JSON.stringify(payload, null, 2);
-        if (payload.status === 'completed' || payload.status === 'failed') {{
+        if (
+          payload.status === 'completed' ||
+          payload.status === 'completed_with_errors' ||
+          payload.status === 'failed'
+        ) {{
           break;
         }}
         await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -311,15 +322,18 @@ def _render_trace_page(job_id: str, payload: dict[str, Any]) -> str:
         )
         for label, row in payload.get("debug_artifacts", {}).items()
     ) or "<li>No stored artifact links yet</li>"
-    error_html = ""
+    error_blocks: list[str] = []
+    if payload.get("summary_error"):
+        error_blocks.append("<h3>Summary error</h3>")
+        error_blocks.append(f"<pre>{html.escape(str(payload.get('summary_error')))}</pre>")
     if payload.get("error"):
-        error_html = (
-            "<section>"
-            "<h2>Failure</h2>"
-            f"<pre>{html.escape(str(payload.get('error')))}</pre>"
-            f"<pre>{html.escape(str(payload.get('error_traceback', '')))}</pre>"
-            "</section>"
-        )
+        error_blocks.append("<h3>Pipeline failure</h3>")
+        error_blocks.append(f"<pre>{html.escape(str(payload.get('error')))}</pre>")
+        if payload.get("error_traceback"):
+            error_blocks.append(f"<pre>{html.escape(str(payload.get('error_traceback', '')))}</pre>")
+    error_html = ""
+    if error_blocks:
+        error_html = "<section><h2>Errors</h2>" + "".join(error_blocks) + "</section>"
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -338,6 +352,7 @@ def _render_trace_page(job_id: str, payload: dict[str, Any]) -> str:
     <h1>{html.escape(job_id)}</h1>
     <p>Status: {html.escape(str(payload.get('status', 'unknown')))}</p>
     <p><a href="/ui/runs/{html.escape(job_id)}">JSON status</a></p>
+    <p><a href="/ui/runs/{html.escape(job_id)}/summary">Summary Results</a></p>
     <p><a href="/">Back</a></p>
   </section>
   <section>
@@ -362,6 +377,1236 @@ def _render_trace_page(job_id: str, payload: dict[str, Any]) -> str:
 </body>
 </html>
 """.strip()
+
+
+
+def _dedupe_display_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str, ...], int | None, str | None]] = set()
+    for item in items:
+        text_key = " ".join(str(item.get("text") or "").split()).strip().lower()
+        citation_key = tuple(str(value) for value in item.get("citation_ids", []))
+        key = (text_key, citation_key, item.get("page"), item.get("pdf_id"))
+        if not text_key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+
+def _merge_sections_for_display(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not sections:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    page_groups: dict[tuple[str, int], dict[str, Any]] = {}
+
+    for section in sections:
+        kind = str(section.get("kind") or "")
+        debug_only = bool(section.get("debug_only"))
+        pdf_id = section.get("pdf_id")
+        page = section.get("page")
+        if (
+            not debug_only
+            and kind in {"page_summary", "key_facts"}
+            and isinstance(pdf_id, str)
+            and isinstance(page, int)
+        ):
+            key = (pdf_id, page)
+            group = page_groups.get(key)
+            if group is None:
+                group = {
+                    "section_id": f"page-{page}-sequence",
+                    "title": f"{pdf_id} · Page {page}",
+                    "kind": "page_sequence",
+                    "debug_only": False,
+                    "pdf_id": pdf_id,
+                    "page": page,
+                    "items": [],
+                }
+                page_groups[key] = group
+                merged.append(group)
+            group["items"].extend(list(section.get("items") or []))
+            continue
+        merged.append(section)
+
+    for section in merged:
+        if isinstance(section.get("items"), list):
+            section["items"] = _dedupe_display_items(list(section.get("items") or []))
+
+    supported_sections = [section for section in merged if section.get("kind") == "supported_summary"]
+    page_sections = [section for section in merged if section.get("kind") == "page_sequence"]
+    other_sections = [
+        section
+        for section in merged
+        if section.get("kind") not in {"supported_summary", "chronology", "page_sequence"}
+    ]
+    page_sections.sort(key=lambda section: (str(section.get("pdf_id") or ""), int(section.get("page") or 0)))
+
+    detailed_items: list[dict[str, Any]] = []
+    for section in supported_sections:
+        detailed_items.extend(list(section.get("items") or []))
+    for section in page_sections:
+        page_title = str(section.get("title") or "Page")
+        for item in list(section.get("items") or []):
+            item_copy = dict(item)
+            text = str(item_copy.get("text") or "").strip()
+            if text:
+                item_copy["text"] = f"{page_title}: {text}"
+            item_copy.setdefault("pdf_id", section.get("pdf_id"))
+            item_copy.setdefault("page", section.get("page"))
+            detailed_items.append(item_copy)
+    detailed_items = _dedupe_display_items(detailed_items)
+
+    detailed_sections: list[dict[str, Any]] = []
+    if detailed_items:
+        detailed_sections.append(
+            {
+                "section_id": "detailed-summary",
+                "title": "Detailed Summary",
+                "kind": "detailed_summary",
+                "debug_only": False,
+                "items": detailed_items,
+            }
+        )
+
+    return [*detailed_sections, *other_sections]
+
+
+def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    summary_path = _normalize_repo_path(payload.get("summary_path"))
+    manifest_path = _normalize_repo_path(payload.get("manifest_path"))
+    if summary_path is None or manifest_path is None:
+        raise HTTPException(status_code=409, detail="summary artifacts are not available for this job yet")
+    if not summary_path.exists():
+        raise HTTPException(status_code=404, detail=f"summary not found: {summary_path}")
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail=f"manifest not found: {manifest_path}")
+
+    source_pdf = _normalize_repo_path(payload.get("pdf_path"))
+    summary, citation_index_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
+        summary_path=summary_path,
+        manifest_path=manifest_path,
+        source_pdf=source_pdf,
+    )
+
+    payload["citation_index_path"] = citation_index_path.as_posix()
+    payload["resolved_citations_path"] = resolved_citations_path.as_posix()
+    if source_pdf_copy_path:
+        payload["source_pdf_copy_path"] = source_pdf_copy_path.as_posix()
+    payload["debug_artifacts"] = _job_debug_artifacts(payload)
+
+    citation_lookup = {entry.id: entry for entry in summary.citation_index}
+    citation_index = []
+    for entry in summary.citation_index:
+        row = entry.model_dump(mode="json")
+        row["page_image_url"] = _debug_url_for_path(row.get("page_image_path"))
+        row["source_pdf_url"] = _debug_url_for_path(row.get("source_pdf_path"))
+        citation_index.append(row)
+
+    resolved = summary.resolved_citations.model_dump(mode="json") if summary.resolved_citations else {"sections": [], "source_pages": []}
+    for section in resolved.get("sections", []):
+        for item in section.get("items", []):
+            item["citation_numbers"] = [
+                citation_lookup[citation_id].number
+                for citation_id in item.get("citation_ids", [])
+                if citation_id in citation_lookup
+            ]
+    for page in resolved.get("source_pages", []):
+        page["image_url"] = _debug_url_for_path(page.get("image_path"))
+        page["html_url"] = _debug_url_for_path(page.get("html_path"))
+        page["source_pdf_url"] = _debug_url_for_path(page.get("source_pdf_path"))
+
+    return {
+        "job": {
+            "job_id": job_id,
+            "status": payload.get("status"),
+            "run_id": payload.get("run_id"),
+            "pdf_path": payload.get("pdf_path"),
+            "question": payload.get("question"),
+            "max_pages": payload.get("max_pages"),
+            "summary_error": payload.get("summary_error"),
+        },
+        "title": summary.draft_title or summary.scope.title,
+        "scope": summary.scope.model_dump(mode="json"),
+        "summary": summary.model_dump(mode="json"),
+        "citation_index": citation_index,
+        "sections": _merge_sections_for_display(list(resolved.get("sections", []))),
+        "source_pages": resolved.get("source_pages", []),
+        "resolved_debug": resolved.get("debug", {}),
+        "artifacts": payload.get("debug_artifacts", {}),
+        "urls": {
+            "status": f"/ui/runs/{quote(job_id)}",
+            "trace": f"/ui/runs/{quote(job_id)}/trace",
+            "summary_json": _debug_url_for_path(summary_path.as_posix()),
+            "citation_index": _debug_url_for_path(citation_index_path.as_posix()),
+            "resolved_citations": _debug_url_for_path(resolved_citations_path.as_posix()),
+            "source_pdf": _debug_url_for_path(source_pdf_copy_path.as_posix()) if source_pdf_copy_path else None,
+        },
+    }
+
+
+def _render_summary_page(job_id: str) -> str:
+    html_page = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Summary Results</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3efe7;
+      --panel: rgba(255, 252, 247, 0.94);
+      --panel-strong: #fffdf8;
+      --border: #d7ccb7;
+      --ink: #1f1a14;
+      --muted: #625644;
+      --accent: #1c6a63;
+      --accent-soft: rgba(28, 106, 99, 0.1);
+      --accent-strong: #0e4c47;
+      --warn: #b7682d;
+      --danger: #9b3c2f;
+      --shadow: 0 18px 50px rgba(58, 44, 24, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(28, 106, 99, 0.12), transparent 28%),
+        radial-gradient(circle at top right, rgba(183, 104, 45, 0.12), transparent 24%),
+        linear-gradient(180deg, #f8f3ec 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+    a { color: var(--accent-strong); }
+    .page {
+      width: min(1600px, calc(100vw - 32px));
+      margin: 16px auto 32px;
+      display: grid;
+      gap: 16px;
+    }
+    .hero {
+      display: grid;
+      gap: 12px;
+      padding: 18px 20px;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: linear-gradient(135deg, rgba(255,255,255,0.96), rgba(246, 240, 229, 0.96));
+      box-shadow: var(--shadow);
+    }
+    .hero-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .title-wrap h1 {
+      margin: 0;
+      font-size: clamp(1.35rem, 3vw, 2rem);
+      line-height: 1.1;
+    }
+    .title-wrap p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      max-width: 78ch;
+    }
+    .chip-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .chip,
+    .link-chip,
+    .toggle-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 8px 14px;
+      background: #fff;
+      color: var(--ink);
+      text-decoration: none;
+      font: inherit;
+    }
+    .toggle-chip {
+      cursor: pointer;
+      background: var(--accent-soft);
+      border-color: rgba(28, 106, 99, 0.25);
+    }
+    .toggle-chip[data-active="true"] {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .summary-shell {
+      display: grid;
+      grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.05fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 72vh;
+    }
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(215, 204, 183, 0.8);
+      background: linear-gradient(180deg, rgba(255,255,255,0.9), rgba(247, 241, 232, 0.95));
+    }
+    .panel-head h2,
+    .panel-head h3 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .summary-pane {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    .summary-scroll,
+    .viewer-scroll,
+    .artifact-scroll {
+      overflow: auto;
+      min-height: 0;
+    }
+    .summary-scroll {
+      padding: 14px 16px 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .summary-section {
+      border: 1px solid rgba(215, 204, 183, 0.75);
+      border-radius: 18px;
+      background: var(--panel-strong);
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .summary-section h3 {
+      margin: 0;
+      font-size: 0.97rem;
+      letter-spacing: 0.01em;
+    }
+    .summary-section[data-debug="true"] {
+      border-style: dashed;
+      background: rgba(245, 240, 231, 0.95);
+    }
+    .sentence-list {
+      display: grid;
+      gap: 8px;
+    }
+    .sentence-card {
+      width: 100%;
+      text-align: left;
+      border: 1px solid rgba(205, 194, 175, 0.95);
+      border-radius: 16px;
+      background: #fff;
+      padding: 14px 15px;
+      color: inherit;
+      cursor: pointer;
+      display: grid;
+      gap: 12px;
+      transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+    }
+    .sentence-card:hover {
+      transform: translateY(-1px);
+      border-color: rgba(28, 106, 99, 0.45);
+      box-shadow: 0 10px 24px rgba(35, 82, 77, 0.12);
+    }
+    .sentence-card[data-active="true"] {
+      border-color: rgba(28, 106, 99, 0.85);
+      box-shadow: 0 0 0 2px rgba(28, 106, 99, 0.13), 0 12px 30px rgba(35, 82, 77, 0.16);
+    }
+    .sentence-card[data-disabled="true"] {
+      cursor: default;
+      opacity: 0.88;
+    }
+    .sentence-text {
+      margin: 0;
+      line-height: 1.64;
+      font-size: 0.97rem;
+    }
+    .sentence-copy {
+      display: inline;
+    }
+    .sentence-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .marker {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      margin-left: 6px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border: 1px solid rgba(28, 106, 99, 0.22);
+      font-weight: 800;
+      font-size: 0.72rem;
+      line-height: 1;
+      vertical-align: super;
+      transform: translateY(-0.25em);
+      box-shadow: 0 4px 10px rgba(35, 82, 77, 0.08);
+    }
+    .marker[data-active="true"] {
+      background: var(--accent-strong);
+      color: #fff;
+      border-color: rgba(28, 106, 99, 0.88);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 0.8rem;
+      border: 1px solid rgba(215, 204, 183, 0.95);
+      background: rgba(247, 243, 235, 0.95);
+      color: var(--muted);
+    }
+    .badge.warn { color: var(--warn); border-color: rgba(183, 104, 45, 0.24); background: rgba(248, 231, 216, 0.88); }
+    .badge.err { color: var(--danger); border-color: rgba(155, 60, 47, 0.24); background: rgba(251, 233, 229, 0.9); }
+    .viewer-pane {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+    }
+    .viewer-meta {
+      padding: 16px 18px 12px;
+      display: grid;
+      gap: 10px;
+      border-bottom: 1px solid rgba(215, 204, 183, 0.8);
+    }
+    .viewer-meta h3 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .viewer-meta p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .preview-card,
+    .active-card {
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(215, 204, 183, 0.95);
+      background: rgba(255, 255, 255, 0.9);
+      display: grid;
+      gap: 8px;
+    }
+    .preview-card[hidden] { display: none; }
+    .viewer-scroll {
+      background: linear-gradient(180deg, rgba(246, 241, 232, 0.95), rgba(240, 233, 220, 0.95));
+      padding: 18px 14px 24px;
+      position: relative;
+      display: grid;
+      justify-items: center;
+      align-content: flex-start;
+      gap: 16px;
+    }
+    .viewer-page {
+      position: relative;
+      width: fit-content;
+      max-width: 100%;
+      border: 1px solid rgba(206, 220, 226, 0.98);
+      border-radius: 18px;
+      background: #fff;
+      box-shadow: 0 18px 34px rgba(58, 44, 24, 0.14);
+      overflow: hidden;
+    }
+    .viewer-page.is-target {
+      border-color: rgba(28, 106, 99, 0.62);
+      box-shadow: 0 0 0 2px rgba(28, 106, 99, 0.12), 0 18px 34px rgba(58, 44, 24, 0.14);
+    }
+    .viewer-page-label {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 2;
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: rgba(24, 46, 42, 0.84);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .viewer-stage {
+      position: relative;
+      overflow: hidden;
+      background: #fff;
+    }
+    .viewer-image {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .viewer-caption {
+      padding: 10px 14px;
+      border-top: 1px solid rgba(215, 204, 183, 0.82);
+      background: rgba(248, 244, 236, 0.96);
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    .overlay-box,
+    .overlay-union {
+      position: absolute;
+      pointer-events: none;
+      border-radius: 10px;
+    }
+    .overlay-union {
+      border: 3px solid rgba(28, 106, 99, 0.8);
+      background: rgba(28, 106, 99, 0.12);
+      box-shadow: 0 0 0 9999px rgba(14, 21, 20, 0.08);
+    }
+    .overlay-box {
+      border: 2px solid rgba(255, 255, 255, 0.84);
+      background: rgba(28, 106, 99, 0.18);
+    }
+    .viewer-placeholder {
+      min-height: 420px;
+      width: 100%;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      padding: 40px 20px;
+    }
+    .debug-block {
+      border-top: 1px solid rgba(215, 204, 183, 0.8);
+      padding: 14px 16px 18px;
+      background: rgba(248, 244, 236, 0.94);
+    }
+    .debug-block[hidden] { display: none; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(215, 204, 183, 0.9);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.84rem;
+      line-height: 1.5;
+    }
+    .artifacts {
+      display: grid;
+      gap: 8px;
+      padding: 14px 16px 18px;
+    }
+    .artifact-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid rgba(215, 204, 183, 0.86);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.88);
+    }
+    .artifact-row strong { display: block; }
+    .artifact-row small { color: var(--muted); word-break: break-all; }
+    .status-banner {
+      border: 1px solid rgba(155, 60, 47, 0.24);
+      background: rgba(251, 233, 229, 0.92);
+      color: var(--danger);
+      border-radius: 16px;
+      padding: 12px 14px;
+      line-height: 1.45;
+    }
+    .muted { color: var(--muted); }
+    .summary-shell {
+      display: grid;
+      grid-template-columns: minmax(520px, 1.08fr) minmax(380px, 0.92fr);
+      gap: 16px;
+      align-items: stretch;
+    }
+    .viewer-pane {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+      min-height: 78vh;
+      background: #f6fbf9;
+    }
+    .summary-pane {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-height: 78vh;
+    }
+    .pdf-viewer {
+      position: relative;
+      border-top: 1px solid rgba(215, 204, 183, 0.82);
+      background: #f8fdff;
+      min-height: 620px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      display: grid;
+      justify-items: center;
+      align-content: flex-start;
+      gap: 14px;
+      padding: 12px;
+    }
+    .pdf-placeholder {
+      min-height: 420px;
+      width: 100%;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: var(--muted);
+      padding: 40px 20px;
+    }
+    .pdf-page {
+      position: relative;
+      width: fit-content;
+      max-width: 100%;
+      border: 1px solid #d9e8ef;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 10px 24px rgba(13, 76, 103, 0.1);
+      overflow: hidden;
+    }
+    .pdf-page.is-target {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(28, 106, 99, 0.18), 0 18px 34px rgba(13, 76, 103, 0.12);
+    }
+    .pdf-page-label {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 2;
+      border-radius: 999px;
+      padding: 4px 9px;
+      background: rgba(24, 46, 42, 0.84);
+      color: #fff;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .pdf-stage {
+      position: relative;
+      overflow: hidden;
+      background: #fff;
+    }
+    .pdf-page-image {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .pdf-text-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    .citation-union {
+      position: absolute;
+      pointer-events: none;
+      border: 3px solid rgba(28, 106, 99, 0.82);
+      background: rgba(28, 106, 99, 0.12);
+      border-radius: 12px;
+      box-shadow: 0 0 0 9999px rgba(14, 21, 20, 0.08);
+    }
+    .citation-box {
+      position: absolute;
+      pointer-events: auto;
+      appearance: none;
+      padding: 0;
+      margin: 0;
+      border: 2px solid rgba(255, 163, 84, 0.96);
+      background: rgba(255, 199, 140, 0.14);
+      border-radius: 10px;
+      box-shadow: 0 10px 22px rgba(95, 58, 22, 0.18);
+      cursor: pointer;
+      transition: transform 0.14s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+    }
+    .citation-box:hover,
+    .citation-box:focus-visible,
+    .citation-box[data-active="true"] {
+      border-color: rgba(255, 138, 69, 1);
+      background: rgba(255, 205, 150, 0.2);
+      box-shadow: 0 14px 28px rgba(95, 58, 22, 0.24), 0 0 0 3px rgba(255, 138, 69, 0.18);
+      outline: none;
+      transform: translateY(-1px);
+    }
+    .pdf-page-meta {
+      padding: 10px 14px;
+      border-top: 1px solid rgba(215, 204, 183, 0.82);
+      background: rgba(248, 244, 236, 0.96);
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    @media (max-width: 1100px) {
+      .summary-shell { grid-template-columns: 1fr; }
+      .panel { min-height: auto; }
+      .viewer-pane { min-height: 60vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <div class="hero-top">
+        <div class="title-wrap">
+          <h1 id="page-title">Loading summary results…</h1>
+          <p id="page-subtitle" class="muted">Preparing citation-backed summary output.</p>
+        </div>
+        <div class="chip-row">
+          <button id="debug-toggle" class="toggle-chip" type="button" data-active="false">Debug</button>
+          <a id="status-link" class="link-chip" href="#">JSON Status</a>
+          <a id="trace-link" class="link-chip" href="#">Trace</a>
+          <a id="summary-json-link" class="link-chip" href="#">Summary JSON</a>
+        </div>
+      </div>
+      <div id="status-banner" class="status-banner" hidden></div>
+    </section>
+
+    <section class="summary-shell">
+      <div class="panel viewer-pane">
+        <div class="panel-head">
+          <h2>Source Viewer</h2>
+          <span id="viewer-chip" class="badge">No citation selected</span>
+        </div>
+        <div class="viewer-meta">
+          <div class="active-card">
+            <h3 id="active-title">Select a sentence to inspect the source.</h3>
+            <p id="active-meta">The viewer will jump to the rendered PDF page and highlight the matched OCR region.</p>
+            <div class="chip-row">
+              <a id="source-pdf-link" class="link-chip" href="#" hidden>Open Source PDF</a>
+            </div>
+          </div>
+        </div>
+        <div id="viewer-scroll" class="viewer-scroll pdf-viewer">
+          <div id="viewer-placeholder" class="pdf-placeholder">Select a summary sentence to open the cited evidence.</div>
+        </div>
+        <div id="debug-block" class="debug-block" hidden>
+          <h3>Active Citation Debug</h3>
+          <pre id="debug-json">{}</pre>
+        </div>
+      </div>
+
+      <div class="panel summary-pane">
+        <div class="panel-head">
+          <h2>Grounded Summary</h2>
+          <span id="summary-count" class="badge">0 cited sentences</span>
+        </div>
+        <div id="summary-scroll" class="summary-scroll"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Artifacts</h2>
+        <span class="badge">Run-side outputs</span>
+      </div>
+      <div id="artifact-scroll" class="artifacts"></div>
+    </section>
+  </div>
+
+  <script>
+    const jobId = "__JOB_ID__";
+    const state = {
+      model: null,
+      debugMode: new URLSearchParams(window.location.search).get("debug") === "1",
+      citationById: new Map(),
+      citationByNumber: new Map(),
+      pageByKey: new Map(),
+      activeCitationId: null,
+      activeItemId: null,
+    };
+
+    const el = {
+      pageTitle: document.getElementById("page-title"),
+      pageSubtitle: document.getElementById("page-subtitle"),
+      statusBanner: document.getElementById("status-banner"),
+      debugToggle: document.getElementById("debug-toggle"),
+      statusLink: document.getElementById("status-link"),
+      traceLink: document.getElementById("trace-link"),
+      summaryJsonLink: document.getElementById("summary-json-link"),
+      summaryCount: document.getElementById("summary-count"),
+      summaryScroll: document.getElementById("summary-scroll"),
+      viewerChip: document.getElementById("viewer-chip"),
+      activeTitle: document.getElementById("active-title"),
+      activeMeta: document.getElementById("active-meta"),
+      sourcePdfLink: document.getElementById("source-pdf-link"),
+      viewerScroll: document.getElementById("viewer-scroll"),
+      viewerPlaceholder: document.getElementById("viewer-placeholder"),
+      debugBlock: document.getElementById("debug-block"),
+      debugJson: document.getElementById("debug-json"),
+      artifactScroll: document.getElementById("artifact-scroll"),
+    };
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function citationForId(id) {
+      return id ? state.citationById.get(String(id)) || null : null;
+    }
+
+    function citationNumbersForItem(item) {
+      return Array.isArray(item?.citation_numbers) ? item.citation_numbers : [];
+    }
+
+    function firstCitationForItem(item) {
+      if (!Array.isArray(item?.citation_ids) || !item.citation_ids.length) return null;
+      return citationForId(item.citation_ids[0]);
+    }
+
+    function pageForCitation(citation) {
+      if (citation?.page_key && state.pageByKey.has(String(citation.page_key))) {
+        return state.pageByKey.get(String(citation.page_key)) || null;
+      }
+      return Array.isArray(state.model?.source_pages) && state.model.source_pages.length
+        ? state.model.source_pages[0]
+        : null;
+    }
+
+    function getViewerPageElement(pageKey) {
+      return Array.from(el.viewerScroll.querySelectorAll(".pdf-page")).find(
+        (node) => node.dataset.pageKey === String(pageKey || "")
+      ) || null;
+    }
+
+    function focusSummaryItem(itemId, smooth = true) {
+      if (!itemId) return false;
+      const target = el.summaryScroll.querySelector(`.sentence-card[data-item-id="${String(itemId)}"]`);
+      if (!(target instanceof HTMLElement)) return false;
+      target.scrollIntoView({ block: "center", behavior: smooth ? "smooth" : "auto" });
+      return true;
+    }
+
+    function setDebugMode(nextValue) {
+      state.debugMode = !!nextValue;
+      el.debugToggle.dataset.active = String(state.debugMode);
+      const url = new URL(window.location.href);
+      if (state.debugMode) url.searchParams.set("debug", "1");
+      else url.searchParams.delete("debug");
+      window.history.replaceState({}, "", url);
+      renderSections();
+      renderArtifacts();
+      renderActiveCitation();
+    }
+
+    function showStatusError(message) {
+      el.statusBanner.hidden = false;
+      el.statusBanner.textContent = String(message || "Unknown error");
+    }
+
+    function hideStatusError() {
+      el.statusBanner.hidden = true;
+      el.statusBanner.textContent = "";
+    }
+
+    function renderArtifacts() {
+      const artifacts = state.model?.artifacts || {};
+      el.artifactScroll.innerHTML = "";
+      Object.entries(artifacts).forEach(([label, row]) => {
+        if (!state.debugMode && (label === "trace_events" || label === "trace_summary")) return;
+        const wrap = document.createElement("div");
+        wrap.className = "artifact-row";
+        const left = document.createElement("div");
+        left.innerHTML = `<strong>${escapeHtml(label)}</strong><small>${escapeHtml(row.path || "")}</small>`;
+        wrap.appendChild(left);
+        if (row.url) {
+          const link = document.createElement("a");
+          link.className = "link-chip";
+          link.href = row.url;
+          link.textContent = "Open";
+          wrap.appendChild(link);
+        }
+        el.artifactScroll.appendChild(wrap);
+      });
+      if (!el.artifactScroll.childElementCount) {
+        el.artifactScroll.innerHTML = '<div class="muted">No artifact links available.</div>';
+      }
+    }
+
+    function computeDisplayScale(citation, page) {
+      const width = Number(page?.width || citation?.page_width || 1200);
+      const availableWidth = Math.max(320, Math.min((el.viewerScroll.clientWidth || 980) - 28, 980));
+      return Math.min(1, availableWidth / Math.max(width, 1));
+    }
+
+    function scrollViewerToElement(node, centerFraction = 0.2, smooth = true) {
+      if (!(node instanceof HTMLElement)) return;
+      const container = el.viewerScroll;
+      const containerRect = container.getBoundingClientRect();
+      const nodeRect = node.getBoundingClientRect();
+      const targetTop = container.scrollTop + (nodeRect.top - containerRect.top) - (container.clientHeight * centerFraction);
+      container.scrollTo({ top: Math.max(0, Math.floor(targetTop)), behavior: smooth ? "smooth" : "auto" });
+    }
+
+    function scrollViewerHitIntoView(hitNode, smooth = true) {
+      scrollViewerToElement(hitNode, 0.35, smooth);
+    }
+
+    function focusViewerPage(pageKey, smooth = true) {
+      const target = getViewerPageElement(pageKey);
+      if (!(target instanceof HTMLElement)) return false;
+      el.viewerScroll.querySelectorAll(".pdf-page.is-target").forEach((node) => node.classList.remove("is-target"));
+      target.classList.add("is-target");
+      scrollViewerToElement(target, 0.08, smooth);
+      return true;
+    }
+
+    function centerOnCitation(citation, _scale, stage) {
+      if (!(stage instanceof HTMLElement)) {
+        el.viewerScroll.scrollTo({ top: 0, left: 0, behavior: "smooth" });
+        return;
+      }
+      const firstHit = stage.querySelector('.citation-box[data-active="true"]') || stage.querySelector('.citation-union');
+      if (firstHit instanceof HTMLElement) {
+        scrollViewerHitIntoView(firstHit, true);
+        return;
+      }
+      const pageNode = stage.closest('.pdf-page');
+      if (pageNode instanceof HTMLElement) {
+        scrollViewerToElement(pageNode, 0.12, true);
+        return;
+      }
+      el.viewerScroll.scrollTo({ top: 0, left: 0, behavior: "smooth" });
+    }
+
+    function renderViewer(citation) {
+      const sourcePages = Array.isArray(state.model?.source_pages) ? state.model.source_pages : [];
+      const activePage = pageForCitation(citation);
+      const sourcePdfUrl = citation?.source_pdf_url || activePage?.source_pdf_url || state.model?.urls?.source_pdf || null;
+
+      el.viewerScroll.innerHTML = "";
+      el.sourcePdfLink.hidden = !sourcePdfUrl;
+      if (sourcePdfUrl) {
+        const pageNumber = citation?.page || activePage?.page || 1;
+        el.sourcePdfLink.href = `${sourcePdfUrl}#page=${pageNumber}`;
+      }
+
+      if (!citation) {
+        el.viewerChip.textContent = "No citation selected";
+      } else {
+        el.viewerChip.textContent = `Citation ${citation.number}`;
+      }
+
+      if (!sourcePages.length) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "pdf-placeholder";
+        placeholder.textContent = "No rendered source page is available for this summary item.";
+        el.viewerScroll.appendChild(placeholder);
+        return;
+      }
+
+      const fragment = document.createDocumentFragment();
+      const pagesToRender = activePage ? [activePage] : sourcePages.slice(0, 1);
+      pagesToRender.forEach((page) => {
+        const imageUrl = page.image_url || (citation?.page_key === page.page_key ? citation.page_image_url : null);
+        if (!imageUrl) return;
+
+        const scale = computeDisplayScale(citation, page);
+        const width = Number(page.width || citation?.page_width || 1200);
+        const height = Number(page.height || citation?.page_height || 1600);
+        const displayWidth = Math.round(width * scale);
+        const displayHeight = Math.round(height * scale);
+        const isTargetPage = !!citation && String(page.page_key || "") === String(citation.page_key || "");
+
+        const pageCard = document.createElement("section");
+        pageCard.className = "pdf-page";
+        pageCard.dataset.page = String(page.page || 0);
+        pageCard.dataset.pageKey = String(page.page_key || "");
+        if (isTargetPage) pageCard.classList.add("is-target");
+
+        const label = document.createElement("div");
+        label.className = "pdf-page-label";
+        label.textContent = `${page.pdf_id} · Page ${page.page}`;
+        pageCard.appendChild(label);
+
+        const stage = document.createElement("div");
+        stage.className = "pdf-stage";
+        stage.style.width = `${displayWidth}px`;
+        stage.style.height = `${displayHeight}px`;
+        pageCard.appendChild(stage);
+
+        const image = document.createElement("img");
+        image.className = "pdf-page-image";
+        image.src = imageUrl;
+        image.alt = `${page.pdf_id} page ${page.page}`;
+        image.width = displayWidth;
+        image.height = displayHeight;
+        stage.appendChild(image);
+
+        const textLayer = document.createElement("div");
+        textLayer.className = "pdf-text-layer";
+        stage.appendChild(textLayer);
+
+        if (isTargetPage && citation?.bbox?.width && citation?.bbox?.height && !citation.degraded) {
+          const union = document.createElement("div");
+          union.className = "citation-union";
+          union.style.left = `${(citation.bbox.left || 0) * scale}px`;
+          union.style.top = `${(citation.bbox.top || 0) * scale}px`;
+          union.style.width = `${(citation.bbox.width || 0) * scale}px`;
+          union.style.height = `${(citation.bbox.height || 0) * scale}px`;
+          textLayer.appendChild(union);
+        }
+
+        const boxes = isTargetPage && Array.isArray(citation?.boxes) ? citation.boxes : [];
+        boxes.forEach((box, index) => {
+          const bbox = box?.bbox || {};
+          if (!bbox.width || !bbox.height) return;
+          const hit = document.createElement("button");
+          hit.type = "button";
+          hit.className = "citation-box";
+          hit.dataset.active = "true";
+          hit.dataset.boxIndex = String(index);
+          hit.style.left = `${Math.max(0, (bbox.left || 0) * scale)}px`;
+          hit.style.top = `${Math.max(0, (bbox.top || 0) * scale)}px`;
+          hit.style.width = `${Math.max(10, (bbox.width || 0) * scale)}px`;
+          hit.style.height = `${Math.max(10, (bbox.height || 0) * scale)}px`;
+          hit.title = `[${citation.number}] ${citation.label}`;
+          hit.setAttribute("aria-label", `Citation ${citation.number} region ${index + 1} on page ${page.page}`);
+          hit.addEventListener("click", () => {
+            activateCitation(citation.id, state.activeItemId);
+            focusSummaryItem(state.activeItemId);
+          });
+          textLayer.appendChild(hit);
+        });
+
+        const caption = document.createElement("div");
+        caption.className = "pdf-page-meta";
+        if (!citation) {
+          caption.textContent = `Available source page ${page.page} for ${page.pdf_id}.`;
+        } else if (isTargetPage && citation.degraded) {
+          caption.textContent = `Degraded citation mapping on ${page.pdf_id} page ${page.page}. The page is correct, but the highlight falls back to page-level evidence.`;
+        } else if (isTargetPage) {
+          caption.textContent = `Matched OCR paragraphs on ${page.pdf_id} page ${page.page}. Click a highlighted region to return to the linked summary sentence.`;
+        } else {
+          caption.textContent = `Showing source page ${page.page} for ${page.pdf_id}.`;
+        }
+        pageCard.appendChild(caption);
+
+        image.addEventListener("load", () => {
+          if (isTargetPage) centerOnCitation(citation, scale, stage);
+        }, { once: true });
+
+        fragment.appendChild(pageCard);
+      });
+
+      if (!fragment.childElementCount) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "pdf-placeholder";
+        placeholder.textContent = "No rendered source page is available for this summary item.";
+        el.viewerScroll.appendChild(placeholder);
+        return;
+      }
+      el.viewerScroll.appendChild(fragment);
+      if (activePage?.page_key) {
+        requestAnimationFrame(() => focusViewerPage(activePage.page_key, false));
+      }
+    }
+
+    function renderActiveCitation() {
+      const citation = citationForId(state.activeCitationId);
+      if (!citation) {
+        el.activeTitle.textContent = "Select a sentence to inspect the source.";
+        el.activeMeta.textContent = "The viewer will jump to the rendered PDF page and highlight the matched OCR region.";
+        el.debugBlock.hidden = true;
+        renderViewer(null);
+        return;
+      }
+      el.activeTitle.textContent = `${citation.pdf_id} · Page ${citation.page}`;
+      el.activeMeta.textContent = citation.degraded
+        ? `${citation.snippet || citation.label} • degraded mapping fallback on page ${citation.page}`
+        : `${citation.snippet || citation.label}`;
+      el.debugBlock.hidden = !state.debugMode;
+      el.debugJson.textContent = JSON.stringify(citation, null, 2);
+      renderViewer(citation);
+    }
+
+    function activateCitation(citationId, itemId = null) {
+      const citation = citationForId(citationId);
+      if (!citation) return;
+      state.activeCitationId = citation.id;
+      state.activeItemId = itemId || state.activeItemId;
+      const url = new URL(window.location.href);
+      url.searchParams.set("citation", String(citation.number));
+      if (state.debugMode) url.searchParams.set("debug", "1");
+      else url.searchParams.delete("debug");
+      window.history.replaceState({}, "", url);
+      renderSections();
+      renderActiveCitation();
+    }
+
+    function renderSections() {
+      const sections = Array.isArray(state.model?.sections) ? state.model.sections : [];
+      el.summaryScroll.innerHTML = "";
+      let visibleSentenceCount = 0;
+      sections.forEach((section) => {
+        if (section.debug_only && !state.debugMode) return;
+        const wrap = document.createElement("section");
+        wrap.className = "summary-section";
+        wrap.dataset.debug = String(!!section.debug_only);
+        const heading = document.createElement("h3");
+        heading.textContent = section.title;
+        wrap.appendChild(heading);
+
+        const list = document.createElement("div");
+        list.className = "sentence-list";
+        (section.items || []).forEach((item) => {
+          visibleSentenceCount += 1;
+          const sentence = document.createElement("button");
+          sentence.type = "button";
+          sentence.className = "sentence-card";
+          sentence.dataset.itemId = item.item_id;
+          sentence.dataset.active = String(item.item_id === state.activeItemId);
+          sentence.dataset.disabled = String(!item.citation_ids || !item.citation_ids.length);
+          if (!item.citation_ids || !item.citation_ids.length) {
+            sentence.disabled = true;
+          }
+          sentence.addEventListener("click", () => {
+            const citation = firstCitationForItem(item);
+            if (!citation) return;
+            state.activeItemId = item.item_id;
+            activateCitation(citation.id, item.item_id);
+          });
+
+          const text = document.createElement("p");
+          text.className = "sentence-text";
+          const copy = document.createElement("span");
+          copy.className = "sentence-copy";
+          copy.textContent = item.text;
+          text.appendChild(copy);
+          (citationNumbersForItem(item)).forEach((number) => {
+            const citationRow = state.citationByNumber.get(number) || null;
+            const marker = document.createElement("span");
+            marker.className = "marker";
+            marker.dataset.active = String(number === (citationForId(state.activeCitationId)?.number || null));
+            marker.textContent = String(number);
+            marker.title = citationRow?.label || `Citation ${number}`;
+            text.appendChild(marker);
+          });
+          sentence.appendChild(text);
+
+          const meta = document.createElement("div");
+          meta.className = "sentence-meta";
+          if (item.degraded) {
+            const degraded = document.createElement("span");
+            degraded.className = "badge warn";
+            degraded.textContent = "Degraded";
+            meta.appendChild(degraded);
+          }
+          if (item.supported === false) {
+            const unsupported = document.createElement("span");
+            unsupported.className = "badge err";
+            unsupported.textContent = "Unsupported";
+            meta.appendChild(unsupported);
+          }
+          if (meta.childElementCount) {
+            sentence.appendChild(meta);
+          }
+          list.appendChild(sentence);
+        });
+        wrap.appendChild(list);
+        el.summaryScroll.appendChild(wrap);
+      });
+      if (!el.summaryScroll.childElementCount) {
+        el.summaryScroll.innerHTML = '<div class="muted">No summary sections are available yet.</div>';
+      }
+      el.summaryCount.textContent = `${visibleSentenceCount} cited sentence${visibleSentenceCount === 1 ? "" : "s"}`;
+    }
+
+    async function loadModel() {
+      const response = await fetch(`/ui/runs/${encodeURIComponent(jobId)}/summary-data`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || `Failed to load summary data (${response.status})`);
+      }
+      return payload;
+    }
+
+    async function bootstrap() {
+      try {
+        const model = await loadModel();
+        state.model = model;
+        state.citationById = new Map();
+        state.citationByNumber = new Map();
+        state.pageByKey = new Map();
+        (model.citation_index || []).forEach((citation) => {
+          state.citationById.set(String(citation.id), citation);
+          state.citationByNumber.set(Number(citation.number), citation);
+        });
+        (model.source_pages || []).forEach((page) => {
+          state.pageByKey.set(String(page.page_key), page);
+        });
+
+        el.pageTitle.textContent = model.title || "Summary Results";
+        el.pageSubtitle.textContent = `${model.scope?.title || "Summary"} • ${model.job?.status || "unknown status"}`;
+        el.statusLink.href = model.urls?.status || "#";
+        el.traceLink.href = model.urls?.trace || "#";
+        el.summaryJsonLink.href = model.urls?.summary_json || "#";
+        if (model.job?.summary_error) {
+          showStatusError(model.job.summary_error);
+        } else {
+          hideStatusError();
+        }
+
+        renderArtifacts();
+        renderSections();
+        const queryCitation = Number(new URLSearchParams(window.location.search).get("citation") || 0);
+        if (queryCitation && state.citationByNumber.has(queryCitation)) {
+          const citation = state.citationByNumber.get(queryCitation);
+          const item = (model.sections || []).flatMap((section) => section.items || []).find((row) => (row.citation_ids || []).includes(citation.id));
+          state.activeItemId = item?.item_id || null;
+          activateCitation(citation.id, state.activeItemId);
+        } else if ((model.citation_index || []).length) {
+          const first = model.citation_index[0];
+          const item = (model.sections || []).flatMap((section) => section.items || []).find((row) => (row.citation_ids || []).includes(first.id));
+          state.activeItemId = item?.item_id || null;
+          activateCitation(first.id, state.activeItemId);
+        } else {
+          renderActiveCitation();
+        }
+        setDebugMode(state.debugMode);
+      } catch (error) {
+        showStatusError(error instanceof Error ? error.message : String(error));
+        el.summaryScroll.innerHTML = '<div class="muted">Summary data could not be loaded.</div>';
+        renderViewer(null);
+      }
+    }
+
+    el.debugToggle.addEventListener("click", () => setDebugMode(!state.debugMode));
+    bootstrap();
+  </script>
+</body>
+</html>
+"""
+    return html_page.replace("__JOB_ID__", html.escape(job_id))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -529,6 +1774,18 @@ async def create_ui_run(
 @app.get("/ui/runs/{job_id}")
 async def get_ui_run(job_id: str) -> dict[str, Any]:
     return _job_payload(job_id)
+
+
+@app.get("/ui/runs/{job_id}/summary-data")
+async def get_ui_summary_data(job_id: str) -> dict[str, Any]:
+    payload = _job_payload(job_id)
+    return _build_summary_view_model(job_id, payload)
+
+
+@app.get("/ui/runs/{job_id}/summary", response_class=HTMLResponse)
+async def get_ui_summary(job_id: str) -> str:
+    _job_payload(job_id)
+    return _render_summary_page(job_id)
 
 
 @app.get("/ui/runs/{job_id}/trace", response_class=HTMLResponse)

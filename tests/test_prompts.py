@@ -26,3 +26,5 @@ def test_page_map_prompt_requires_indexed_retrieval() -> None:
     assert "Indexed retrieval chunk files for this page: 3" in prompt
     assert "Use the OpenSearch Retrieval Tool now." in prompt
     assert "Do not ask for a URL, file upload, or pasted content." in prompt
+    assert "do not include citations, markdown, code fences, source filenames" in prompt.lower()
+    assert "key_facts must be short atomic claims" in prompt

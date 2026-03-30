@@ -151,12 +151,244 @@ class PageMapSummary(BaseModel):
     key_facts: list[str] = Field(default_factory=list)
     raw_response: str
     retrieved_sources: list[EvidenceHit] = Field(default_factory=list)
+    verified_sentences: list[VerifiedSentence] = Field(default_factory=list)
+    verified_key_facts: list[VerifiedSentence] = Field(default_factory=list)
+    supported_summary: str = ""
+    supported_key_facts: list[str] = Field(default_factory=list)
+    unsupported_sentences: list[str] = Field(default_factory=list)
+    unsupported_key_facts: list[str] = Field(default_factory=list)
+    passed_verification: bool = False
 
 
 class VerifiedSentence(BaseModel):
     sentence: str
     supported: bool
     evidence: list[EvidenceHit] = Field(default_factory=list)
+
+
+TRUTH_FIELD_NAMES = (
+    "date_of_service",
+    "facility",
+    "provider",
+    "patient_reference",
+    "note_type",
+    "chief_complaint",
+    "hpi",
+    "pmh",
+    "psh",
+    "social_history",
+    "allergies",
+    "medications",
+    "vitals",
+    "abnormal_labs",
+    "diagnoses",
+    "assessment",
+    "treatment",
+    "plan",
+    "follow_up",
+    "positive_ros",
+    "positive_physical_exam",
+    "residual_supported_facts",
+)
+
+TRUTH_FIELD_LABELS = {
+    "date_of_service": "Date of Service",
+    "facility": "Facility",
+    "provider": "Provider",
+    "patient_reference": "Patient Reference",
+    "note_type": "Note Type",
+    "chief_complaint": "Chief Complaint",
+    "hpi": "History of Present Illness",
+    "pmh": "Past Medical History",
+    "psh": "Past Surgical History",
+    "social_history": "Social History",
+    "allergies": "Allergies",
+    "medications": "Medications",
+    "vitals": "Vitals",
+    "abnormal_labs": "Abnormal Labs",
+    "diagnoses": "Diagnoses",
+    "assessment": "Assessment",
+    "treatment": "Treatment",
+    "plan": "Plan",
+    "follow_up": "Follow Up",
+    "positive_ros": "Positive Review of Systems",
+    "positive_physical_exam": "Positive Physical Exam",
+    "residual_supported_facts": "Additional Supported Facts",
+}
+
+
+class SupportedFact(BaseModel):
+    value: str
+    evidence_sentences: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceHit] = Field(default_factory=list)
+
+
+class TruthLayerNote(BaseModel):
+    note_id: str
+    pdf_ids: list[str] = Field(default_factory=list)
+    pages: list[int] = Field(default_factory=list)
+    source_filenames: list[str] = Field(default_factory=list)
+    date_of_service: list[SupportedFact] = Field(default_factory=list)
+    facility: list[SupportedFact] = Field(default_factory=list)
+    provider: list[SupportedFact] = Field(default_factory=list)
+    patient_reference: list[SupportedFact] = Field(default_factory=list)
+    note_type: list[SupportedFact] = Field(default_factory=list)
+    chief_complaint: list[SupportedFact] = Field(default_factory=list)
+    hpi: list[SupportedFact] = Field(default_factory=list)
+    pmh: list[SupportedFact] = Field(default_factory=list)
+    psh: list[SupportedFact] = Field(default_factory=list)
+    social_history: list[SupportedFact] = Field(default_factory=list)
+    allergies: list[SupportedFact] = Field(default_factory=list)
+    medications: list[SupportedFact] = Field(default_factory=list)
+    vitals: list[SupportedFact] = Field(default_factory=list)
+    abnormal_labs: list[SupportedFact] = Field(default_factory=list)
+    diagnoses: list[SupportedFact] = Field(default_factory=list)
+    assessment: list[SupportedFact] = Field(default_factory=list)
+    treatment: list[SupportedFact] = Field(default_factory=list)
+    plan: list[SupportedFact] = Field(default_factory=list)
+    follow_up: list[SupportedFact] = Field(default_factory=list)
+    positive_ros: list[SupportedFact] = Field(default_factory=list)
+    positive_physical_exam: list[SupportedFact] = Field(default_factory=list)
+    residual_supported_facts: list[SupportedFact] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+    def populated_fields(self) -> list[str]:
+        return [field_name for field_name in TRUTH_FIELD_NAMES if getattr(self, field_name, [])]
+
+    def field_values(self, field_name: str) -> list[str]:
+        return [item.value for item in getattr(self, field_name, [])]
+
+
+class ValidationCheck(BaseModel):
+    field_name: str
+    label: str
+    required: bool = False
+    populated: bool = False
+    source_detected: bool = False
+    missing_values: list[str] = Field(default_factory=list)
+    message: str = ""
+
+
+class NoteValidationLayer(BaseModel):
+    note_id: str
+    passed: bool = False
+    requested_fields: list[str] = Field(default_factory=list)
+    populated_fields: list[str] = Field(default_factory=list)
+    missing_required_fields: list[str] = Field(default_factory=list)
+    checks: list[ValidationCheck] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+
+class ValidationLayer(BaseModel):
+    passed: bool = False
+    notes: list[NoteValidationLayer] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresentationItem(BaseModel):
+    item_id: str
+    text: str
+    field_name: str | None = None
+    note_id: str | None = None
+    evidence: list[EvidenceHit] = Field(default_factory=list)
+    candidate_filenames: list[str] = Field(default_factory=list)
+    pdf_ids: list[str] = Field(default_factory=list)
+    pages: list[int] = Field(default_factory=list)
+
+
+class PresentationSection(BaseModel):
+    section_id: str
+    title: str
+    note_id: str | None = None
+    items: list[PresentationItem] = Field(default_factory=list)
+
+
+class PresentationLayer(BaseModel):
+    title: str
+    narrative: str = ""
+    sections: list[PresentationSection] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+
+class CitationBox(BaseModel):
+    text: str = ""
+    block_index: int | None = None
+    paragraph_index: int | None = None
+    page_paragraph_index: int | None = None
+    bbox: dict[str, int] = Field(default_factory=dict)
+
+
+class CitationIndexEntry(BaseModel):
+    id: str
+    number: int
+    chunk_id: str | None = None
+    label: str
+    pdf_id: str
+    page: int
+    snippet: str
+    anchor: str | None = None
+    page_key: str | None = None
+    source_filename: str | None = None
+    page_source_filename: str | None = None
+    page_image_path: str | None = None
+    source_pdf_path: str | None = None
+    page_width: int | None = None
+    page_height: int | None = None
+    block_start: int | None = None
+    block_end: int | None = None
+    paragraph_start: int | None = None
+    paragraph_end: int | None = None
+    page_paragraph_start: int | None = None
+    page_paragraph_end: int | None = None
+    bbox: dict[str, int] = Field(default_factory=dict)
+    boxes: list[CitationBox] = Field(default_factory=list)
+    degraded: bool = False
+    degraded_reason: str | None = None
+
+
+class CitationSentenceItem(BaseModel):
+    item_id: str
+    text: str
+    citation_ids: list[str] = Field(default_factory=list)
+    supported: bool | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
+    pdf_id: str | None = None
+    page: int | None = None
+    debug: dict[str, Any] = Field(default_factory=dict)
+
+
+class CitationSection(BaseModel):
+    section_id: str
+    title: str
+    kind: str
+    debug_only: bool = False
+    pdf_id: str | None = None
+    page: int | None = None
+    items: list[CitationSentenceItem] = Field(default_factory=list)
+
+
+class CitationSourcePage(BaseModel):
+    page_key: str
+    pdf_id: str
+    page: int
+    source_filename: str
+    page_source_filename: str | None = None
+    image_path: str | None = None
+    html_path: str | None = None
+    source_pdf_path: str | None = None
+    width: int | None = None
+    height: int | None = None
+    paragraph_count: int | None = None
+
+
+class ResolvedCitations(BaseModel):
+    version: str = "citation_v1"
+    generated_at: datetime = Field(default_factory=utc_now)
+    citation_index: list[CitationIndexEntry] = Field(default_factory=list)
+    sections: list[CitationSection] = Field(default_factory=list)
+    source_pages: list[CitationSourcePage] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScopedSummaryResult(BaseModel):
@@ -171,6 +403,11 @@ class ScopedSummaryResult(BaseModel):
     verified_sentences: list[VerifiedSentence] = Field(default_factory=list)
     supported_summary: str = ""
     unsupported_sentences: list[str] = Field(default_factory=list)
+    truth_layer: list[TruthLayerNote] = Field(default_factory=list)
+    validation_layer: ValidationLayer | None = None
+    presentation_layer: PresentationLayer | None = None
+    citation_index: list[CitationIndexEntry] = Field(default_factory=list)
+    resolved_citations: ResolvedCitations | None = None
     debug: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -314,6 +551,9 @@ class PdfPipelineResult(BaseModel):
     requested_max_pages: int | None = None
     is_partial_run: bool = False
     summary_path: str | None = None
+    citation_index_path: str | None = None
+    resolved_citations_path: str | None = None
+    source_pdf_copy_path: str | None = None
     summary: ScopedSummaryResult | None = None
     summary_error: str | None = None
     ingestion_results: list[IngestedDocumentResult] = Field(default_factory=list)

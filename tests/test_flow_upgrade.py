@@ -138,11 +138,13 @@ def test_langflow_gateway_upgrade_flows_updates_mounted_files(tmp_path, monkeypa
 
     upgraded_agent = json.loads(agent_path.read_text(encoding="utf-8"))
     upgraded_ingestion = json.loads(ingestion_path.read_text(encoding="utf-8"))
+    prompt_template = upgraded_agent["data"]["nodes"][0]["data"]["node"]["template"]["template"]["value"]
 
     assert result.agent_flow_live_patch_applied is True
     assert result.ingestion_flow_live_patch_applied is True
     assert agent_flow_has_backend_rerank(upgraded_agent) is True
     assert prompt_template_is_upgraded(upgraded_agent) is True
+    assert "citations are attached downstream" in prompt_template
     split_template = upgraded_ingestion["data"]["nodes"][0]["data"]["node"]["template"]
     assert split_template["chunk_size"]["value"] == 1200
     assert split_template["chunk_overlap"]["value"] == 150

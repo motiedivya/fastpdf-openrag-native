@@ -31,6 +31,34 @@ STOPWORDS = {
     "to",
     "with",
 }
+HIGH_VALUE_TERMS = (
+    "subjective",
+    "assessment",
+    "plan",
+    "care plan",
+    "chief complaint",
+    "history of present illness",
+    "procedure",
+    "operation performed",
+    "indication for procedure",
+    "diagnosis",
+    "impression",
+    "follow-up",
+)
+LOW_VALUE_TERMS = (
+    "fax",
+    "phone",
+    "email",
+    "address",
+    "insurance",
+    "member id",
+    "guarantor",
+    "dob",
+    "pid",
+    "printed by",
+    "confidential",
+    "page ",
+)
 
 
 def _normalize_text(value: str) -> str:
@@ -44,11 +72,43 @@ def _tokenize(value: str) -> list[str]:
     return [token for token in TOKEN_RE.findall(_normalize_text(value)) if token not in STOPWORDS and len(token) > 1]
 
 
+def _role_signal(value: str) -> tuple[float, float]:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return 0.0, 0.0
+    high_value = 1.0 if any(term in normalized for term in HIGH_VALUE_TERMS) else 0.0
+    low_value = 1.0 if any(term in normalized for term in LOW_VALUE_TERMS) else 0.0
+    if high_value and low_value:
+        low_value *= 0.35
+    return high_value, low_value
+
+
+def attach_rank_metadata(hits: list[EvidenceHit]) -> list[EvidenceHit]:
+    ranked: list[EvidenceHit] = []
+    for index, hit in enumerate(hits, start=1):
+        base_score = float(hit.base_score if hit.base_score is not None else hit.score or 0.0)
+        rerank_score = float(hit.rerank_score if hit.rerank_score is not None else hit.score or 0.0)
+        ranked.append(
+            hit.model_copy(
+                update={
+                    "score": rerank_score,
+                    "base_score": base_score,
+                    "rerank_score": rerank_score,
+                    "retrieval_rank": hit.retrieval_rank if hit.retrieval_rank is not None else index,
+                }
+            )
+        )
+    return ranked
+
+
 def rerank_hits(query: str, hits: list[EvidenceHit]) -> list[EvidenceHit]:
     if not hits:
         return []
 
     query_tokens = _tokenize(query)
+    if not query_tokens:
+        return attach_rank_metadata(list(hits))
+
     base_scores = [
         float(hit.base_score if hit.base_score is not None else hit.score or 0.0)
         for hit in hits
@@ -95,12 +155,15 @@ def rerank_hits(query: str, hits: list[EvidenceHit]) -> list[EvidenceHit]:
         )
         lead_overlap = 1.0 if matched_tokens and any(token in normalized_text[:240] for token in matched_tokens) else 0.0
         normalized_base = (base_score / max_base_score) if max_base_score > 0 else 0.0
+        high_value_signal, low_value_signal = _role_signal(normalized_text)
         rerank_score = (
-            0.35 * normalized_base
+            0.31 * normalized_base
             + 0.25 * idf_overlap
             + 0.15 * coverage
-            + 0.20 * max(phrase_match, bigram_match)
+            + 0.18 * max(phrase_match, bigram_match)
             + 0.05 * lead_overlap
+            + 0.10 * high_value_signal
+            - 0.08 * low_value_signal
         )
         reranked.append(
             hit.model_copy(
