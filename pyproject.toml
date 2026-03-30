@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastpdf-openrag-native"
+version = "0.1.0"
+description = "OpenRAG-native ingestion, retrieval, and scoped summarization bridge for fastpdf runs."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "google-cloud-vision>=3.10.2",
+  "httpx>=0.28.1",
+  "openrag-sdk>=0.2.2",
+  "pydantic-settings>=2.6.0",
+  "pymupdf>=1.26.4",
+  "pymongo>=4.10.0",
+  "python-multipart>=0.0.20",
+  "typer>=0.12.5",
+  "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+]
+
+[project.scripts]
+fastpdf-openrag-native = "fastpdf_openrag_native.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastpdf_openrag_native"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,26 @@
+{
+  "run_id": "sample-run",
+  "pdfs": [
+    {
+      "pdf_id": "pdf_1",
+      "pages": [
+        {
+          "page": 1,
+          "model_label": "Visit_Note",
+          "ocr_text": "Patient Name: Maria Thompson. Date: 2026-03-01. Chief Complaint: Neck pain and headaches."
+        },
+        {
+          "page": 2,
+          "model_label": "Operative_Report",
+          "pdf2html_text": "Procedure: Selective Nerve Block. The patient was placed supine. Local anesthesia was used. Repeated aspiration checks were negative."
+        },
+        {
+          "page": 3,
+          "model_label": "Operative_Report",
+          "pdf2html_text": "Procedure: Stellate Ganglion Block. Chassaignac's tubercle was identified. 10 cc of injectate was administered under fluoroscopic guidance."
+        }
+      ]
+    }
+  ]
+}
+

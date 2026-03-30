@@ -1,0 +1,16 @@
+{
+  "scope_id": "operative-sequence",
+  "title": "Operative Sequence",
+  "objective": "Summarize the procedure sequence, technique, and clinically relevant details without merging distinct procedures.",
+  "page_refs": [
+    {
+      "pdf_id": "pdf_1",
+      "page": 2
+    },
+    {
+      "pdf_id": "pdf_1",
+      "page": 3
+    }
+  ]
+}
+
