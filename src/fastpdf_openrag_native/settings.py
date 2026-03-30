@@ -178,6 +178,26 @@ class AppSettings(BaseSettings):
         default=180.0,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_INGEST_WAIT_TIMEOUT"),
     )
+    extractor_llm_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_EXTRACTOR_LLM_PROVIDER"),
+    )
+    extractor_llm_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_EXTRACTOR_LLM_MODEL"),
+    )
+    renderer_llm_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_RENDERER_LLM_PROVIDER"),
+    )
+    renderer_llm_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_RENDERER_LLM_MODEL"),
+    )
+    renderer_disable_retrieval: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_RENDERER_DISABLE_RETRIEVAL"),
+    )
 
 
 @lru_cache(maxsize=1)

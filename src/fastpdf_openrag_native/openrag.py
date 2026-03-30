@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +13,49 @@ from .settings import AppSettings, get_settings
 
 
 class OpenRAGGateway:
+    _agent_override_lock: asyncio.Lock | None = None
+
     def __init__(self, settings: AppSettings | None = None):
         self.settings = settings or get_settings()
         self._cached_api_key: str | None = None
+
+    @classmethod
+    def _get_agent_override_lock(cls) -> asyncio.Lock:
+        if cls._agent_override_lock is None:
+            cls._agent_override_lock = asyncio.Lock()
+        return cls._agent_override_lock
+
+    @asynccontextmanager
+    async def _temporary_agent_settings(
+        self,
+        client: OpenRAGClient,
+        *,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+    ):
+        if llm_model is None and llm_provider is None:
+            yield
+            return
+        async with self._get_agent_override_lock():
+            current_settings = await client.settings.get()
+            original_model = current_settings.agent.llm_model
+            original_provider = current_settings.agent.llm_provider
+            target_model = llm_model if llm_model is not None else original_model
+            target_provider = llm_provider if llm_provider is not None else original_provider
+            changed = target_model != original_model or target_provider != original_provider
+            if changed:
+                await client.settings.update({
+                    "llm_model": target_model,
+                    "llm_provider": target_provider,
+                })
+            try:
+                yield
+            finally:
+                if changed:
+                    await client.settings.update({
+                        "llm_model": original_model,
+                        "llm_provider": original_provider,
+                    })
 
     def _discover_local_api_key(self) -> str | None:
         script = (
@@ -218,11 +260,17 @@ class OpenRAGGateway:
         limit: int = 6,
         score_threshold: float = 0,
         filter_id: str | None = None,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ) -> tuple[str, list[EvidenceHit]]:
+        effective_sources = list(data_sources or [])
         filters = None
-        if data_sources:
+        if disable_retrieval and not effective_sources:
+            effective_sources = ["__fastpdf_openrag_renderer_no_sources__"]
+        if effective_sources:
             filters = {
-                "data_sources": data_sources,
+                "data_sources": effective_sources,
                 "document_types": document_types or ["text/markdown", "text/html"],
             }
         body: dict[str, Any] = {
@@ -236,10 +284,15 @@ class OpenRAGGateway:
         if filter_id:
             body["filter_id"] = filter_id
         async with self._client() as client:
-            response = await client._request("POST", "/api/v1/chat", json=body)
+            async with self._temporary_agent_settings(
+                client,
+                llm_model=llm_model,
+                llm_provider=llm_provider,
+            ):
+                response = await client._request("POST", "/api/v1/chat", json=body)
         data = response.json()
         sources = self._coerce_evidence_hits(data.get("sources", []))
-        filtered_sources = self._filter_allowed_sources(sources, data_sources=data_sources)
+        filtered_sources = self._filter_allowed_sources(sources, data_sources=effective_sources)
         return str(data.get("response") or ""), filtered_sources
 
     async def search_on_sources(

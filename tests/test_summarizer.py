@@ -23,9 +23,12 @@ class FakeGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         if "single page" in message:
             source_name = data_sources[0]
@@ -75,9 +78,12 @@ class FakeRetryGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         self.calls += 1
         if self.calls == 1:
@@ -132,9 +138,12 @@ class CaptureRerankGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         self.chat_calls.append(list(data_sources))
         if "Current page:" in message:
@@ -204,9 +213,12 @@ class CaptureBackendRerankGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         self.chat_calls.append(list(data_sources))
         if "Current page:" in message:
@@ -256,9 +268,12 @@ class VerificationFallbackGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         if "Current page:" in message:
             return (
@@ -315,9 +330,12 @@ class VerificationConcurrencyGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         if "Current page:" in message:
             return (
@@ -365,10 +383,15 @@ class MixedPageVerificationGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
+        if "presentation-layer renderer" in message:
+            return (json.dumps({}), [])
         if "Current page:" in message and "page 1" in message:
             return (
                 json.dumps(
@@ -425,9 +448,12 @@ class InformativePageGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         if "Current page:" in message:
             return (
@@ -481,9 +507,12 @@ class GenericReduceGateway:
         self,
         *,
         message: str,
-        data_sources: list[str],
+        data_sources: list[str] | None = None,
         limit: int = 6,
         score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
     ):
         if "Current page:" in message and "page 1" in message:
             return (
@@ -883,9 +912,12 @@ def test_summarize_scope_surfaces_rerank_metadata_and_reuses_generation_pool_for
             self,
             *,
             message: str,
-            data_sources: list[str],
+        data_sources: list[str] | None = None,
             limit: int = 6,
             score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
         ):
             if "Current page:" in message:
                 return (
@@ -1129,9 +1161,12 @@ def test_summarize_scope_sanitizes_source_strings_and_keeps_clean_claims(tmp_pat
             self,
             *,
             message: str,
-            data_sources: list[str],
+        data_sources: list[str] | None = None,
             limit: int = 6,
             score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
         ):
             if "Current page:" in message:
                 return (
@@ -1320,3 +1355,187 @@ def test_filter_page_retrieval_documents_drops_banners_and_boosts_sections() -> 
     assert debug["dropped_count"] == 2
     assert {row["reason"] for row in debug["dropped"]} == {"header_footer_artifact"}
     assert _document_priority_score(documents[1]) > _document_priority_score(documents[2])
+
+
+class LayeredOutputGateway:
+    def __init__(self) -> None:
+        self.override_calls: list[dict[str, object]] = []
+
+    async def chat_on_sources(
+        self,
+        *,
+        message: str,
+        data_sources: list[str] | None = None,
+        limit: int = 6,
+        score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
+    ):
+        self.override_calls.append(
+            {
+                "message": message,
+                "data_sources": list(data_sources or []),
+                "llm_model": llm_model,
+                "llm_provider": llm_provider,
+                "disable_retrieval": disable_retrieval,
+            }
+        )
+        source_name = (data_sources or ["fallback-source.md"])[0]
+        if "strict supported fact sheet" in message:
+            return (
+                json.dumps(
+                    {
+                        "date_of_service": ["09/12/2018"],
+                        "facility": ["Clinica La Esperanza in Albuquerque, New Mexico"],
+                        "provider": ["Susette Eaves CFNP"],
+                        "patient_reference": ["Mr. Reazin"],
+                        "note_type": ["visit note"],
+                        "chief_complaint": ["possible right ear infection with right ear pain for a couple of weeks"],
+                        "hpi": ["right ear pain for 2 weeks with prior upper respiratory infection resolved"],
+                        "allergies": ["nkda"],
+                        "medications": ["hydrocodone acetaminophen 5-325 mg tablet", "oxycodone 5 mg tablet"],
+                        "diagnoses": ["otalgia right ear H92.01"],
+                        "treatment": ["possible surgery or laser treatment"],
+                        "plan": ["ENT follow up with possible surgery or laser treatment"],
+                        "follow_up": ["prn"],
+                        "positive_ros": ["muscle or joint pain"],
+                        "residual_supported_facts": ["Right ear hearing loss could not be corrected with aides"],
+                    }
+                ),
+                [EvidenceHit(filename=source_name, text="structured support", score=0.9)],
+            )
+        if "presentation-layer renderer" in message:
+            return (
+                json.dumps(
+                    {
+                        "title": "Layered Scope",
+                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. Chief complaint was possible right ear infection with right ear pain for a couple of weeks. Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Plan included ENT follow up with possible surgery or laser treatment.",
+                        "sections": [
+                            {
+                                "title": "On 09/12/2018",
+                                "note_id": "note-001",
+                                "items": [
+                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin.", "fact_ids": ["note-001__intro__01"]},
+                                    {"text": "Chief complaint was possible right ear infection with right ear pain for a couple of weeks.", "fact_ids": ["note-001__chief_complaint__01"]},
+                                    {"text": "Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
+                                    {"text": "Diagnoses included otalgia right ear H92.01.", "fact_ids": ["note-001__diagnoses__01"]},
+                                    {"text": "Plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__plan__01"]}
+                                ]
+                            }
+                        ]
+                    }
+                ),
+                [],
+            )
+        if "single page" in message:
+            return (
+                json.dumps(
+                    {
+                        "summary": "Visit note documenting right ear pain, medications, diagnosis, and ENT follow up.",
+                        "key_facts": [
+                            "Date of service 09/12/2018 at Clinica La Esperanza in Albuquerque, New Mexico.",
+                            "Provider Susette Eaves CFNP.",
+                            "Chief complaint possible right ear infection with right ear pain for a couple of weeks.",
+                            "Allergies listed as nkda.",
+                            "Medications hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.",
+                            "Diagnosis otalgia right ear H92.01.",
+                            "Plan ENT follow up with possible surgery or laser treatment.",
+                        ],
+                    }
+                ),
+                [EvidenceHit(filename=source_name, text="page support", score=0.9)],
+            )
+        return (
+            json.dumps(
+                {
+                    "title": "Visit Note Summary",
+                    "summary": "Visit note documenting right ear pain and follow up planning.",
+                    "chronology": ["09/12/2018 visit note documented right ear pain and ENT follow up."],
+                }
+            ),
+            [EvidenceHit(filename=source_name, text="reduce support", score=0.8)],
+        )
+
+    async def search_on_sources(
+        self,
+        *,
+        query: str,
+        data_sources: list[str],
+        limit: int | None = None,
+        score_threshold: float | None = None,
+    ):
+        if query.startswith("page summary ") or query.startswith("overall chronology summary "):
+            return [EvidenceHit(filename=data_sources[0], text="preflight support", score=0.8)]
+        supported_queries = {
+            "Visit note documenting right ear pain, medications, diagnosis, and ENT follow up.",
+            "Date of service 09/12/2018 at Clinica La Esperanza in Albuquerque, New Mexico.",
+            "Provider Susette Eaves CFNP.",
+            "Chief complaint possible right ear infection with right ear pain for a couple of weeks.",
+            "Allergies listed as nkda.",
+            "Medications hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.",
+            "Diagnosis otalgia right ear H92.01.",
+            "Plan ENT follow up with possible surgery or laser treatment.",
+            "Visit note documenting right ear pain and follow up planning.",
+        }
+        if query in supported_queries:
+            return [EvidenceHit(filename=data_sources[0], text="verified support", score=0.8)]
+        return []
+
+
+def test_summarize_scope_emits_truth_validation_and_presentation_layers(tmp_path: Path) -> None:
+    payload = {
+        "pdfs": [
+            {
+                "pdf_id": "visit-note.pdf",
+                "pages": [
+                    {"page": 1, "pdf2html_text": "Visit note page one", "service_date": "09/12/2018"},
+                ],
+            }
+        ]
+    }
+    materialize_summary_payload(
+        run_id="layered-run",
+        summary_payload=payload,
+        source_kind="summary_payload",
+        output_dir=tmp_path,
+    )
+    manifest = load_manifest(tmp_path / "manifest.json")
+    scope = SummaryScope.model_validate(
+        {
+            "scope_id": "layered-scope",
+            "title": "Layered Scope",
+            "objective": "Produce a detailed grounded visit note narrative.",
+            "page_refs": [{"pdf_id": "visit-note.pdf", "page": 1}],
+        }
+    )
+
+    gateway = LayeredOutputGateway()
+    settings = AppSettings(
+        extractor_llm_provider="openai",
+        extractor_llm_model="gpt-5-extractor",
+        renderer_llm_provider="openai",
+        renderer_llm_model="gpt-5-renderer",
+    )
+
+    result = asyncio.run(
+        summarize_scope(gateway, manifest=manifest, scope=scope, settings=settings)
+    )
+
+    assert result.truth_layer
+    truth_note = result.truth_layer[0]
+    assert truth_note.date_of_service[0].value == "09/12/2018"
+    assert truth_note.provider[0].value == "Susette Eaves CFNP"
+    assert any("H92.01" in fact.value for fact in truth_note.diagnoses)
+    assert result.validation_layer is not None
+    assert result.validation_layer.passed is True
+    assert result.presentation_layer is not None
+    assert result.presentation_layer.debug["renderer"] == "llm"
+    assert result.presentation_layer.debug["rendered_by_model"] is True
+    assert result.debug["layered_output_used"] is True
+    assert result.supported_summary.startswith("On 09/12/2018")
+    assert "Susette Eaves CFNP" in result.supported_summary
+    assert "hydrocodone acetaminophen 5-325 mg tablet" in result.supported_summary
+    assert any(item.field_name == "diagnoses" for section in result.presentation_layer.sections for item in section.items)
+    assert any(call["llm_model"] == "gpt-5-extractor" for call in gateway.override_calls if "strict supported fact sheet" in str(call["message"]))
+    assert any(call["llm_model"] == "gpt-5-renderer" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer renderer" in str(call["message"]))

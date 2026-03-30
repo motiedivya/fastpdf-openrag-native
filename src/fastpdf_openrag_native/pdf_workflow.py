@@ -57,6 +57,16 @@ def _build_chunk_stats(chunk_counts: dict[str, int]) -> ChunkStats:
     )
 
 
+def _format_exception_message(exc: BaseException, *, fallback: str = "summary generation failed") -> str:
+    detail = str(exc).strip()
+    error_type = type(exc).__name__
+    if detail:
+        if detail.startswith(f"{error_type}:"):
+            return detail
+        return f"{error_type}: {detail}"
+    return f"{error_type}: {fallback}"
+
+
 def _build_retrieval_debug_payload(
     *,
     diagnostics: OpenSearchIndexDiagnostics | None,
@@ -295,6 +305,7 @@ async def run_pdf_pipeline(
     summary_path = None
     summary_error = None
     citation_index_path = None
+    citation_instances_path = None
     resolved_citations_path = None
     source_pdf_copy_path = None
     try:
@@ -309,6 +320,7 @@ async def run_pdf_pipeline(
             (
                 summary,
                 citation_index_path,
+                citation_instances_path,
                 resolved_citations_path,
                 source_pdf_copy_path,
             ) = ensure_summary_citations(
@@ -324,13 +336,16 @@ async def run_pdf_pipeline(
                 action="build_summary_citations",
                 response={
                     "citation_index_path": citation_index_path.as_posix(),
+                    "citation_instances_path": citation_instances_path.as_posix(),
                     "resolved_citations_path": resolved_citations_path.as_posix(),
-                    "citation_count": len(summary.citation_index),
+                    "citation_count": len(summary.citation_instances),
+                    "evidence_catalog_count": len(summary.citation_index),
                     "section_count": len(summary.resolved_citations.sections) if summary.resolved_citations else 0,
                     "source_pdf_copy_path": source_pdf_copy_path.as_posix() if source_pdf_copy_path else None,
                 },
                 output_files=[
                     citation_index_path.as_posix(),
+                    citation_instances_path.as_posix(),
                     resolved_citations_path.as_posix(),
                     *([source_pdf_copy_path.as_posix()] if source_pdf_copy_path else []),
                 ],
@@ -354,6 +369,7 @@ async def run_pdf_pipeline(
             response={
                 "summary_path": summary_path.as_posix(),
                 "citation_index_path": citation_index_path.as_posix() if citation_index_path else None,
+                "citation_instances_path": citation_instances_path.as_posix() if citation_instances_path else None,
                 "resolved_citations_path": resolved_citations_path.as_posix() if resolved_citations_path else None,
                 "page_summary_count": len(summary.page_summaries),
                 "unsupported_sentences": summary.unsupported_sentences,
@@ -361,17 +377,18 @@ async def run_pdf_pipeline(
             output_files=[
                 summary_path.as_posix(),
                 *([citation_index_path.as_posix()] if citation_index_path else []),
+                *([citation_instances_path.as_posix()] if citation_instances_path else []),
                 *([resolved_citations_path.as_posix()] if resolved_citations_path else []),
             ],
         )
     except Exception as exc:
-        summary_error = str(exc)
+        summary_error = _format_exception_message(exc)
         trace.record(
             stage="summary",
             service="openrag",
             action="summarize_scope",
             status="error",
-            response={"error": str(exc)},
+            response={"error": summary_error, "error_type": type(exc).__name__},
             notes=[
                 "Summary failed after ingestion. Inspect OpenRAG chat/search health and the OpenSearch diagnostics captured in this run."
             ],
@@ -412,6 +429,9 @@ async def run_pdf_pipeline(
             break
 
     chunk_stats = _build_chunk_stats(chunk_counts)
+    if summary is None and summary_path is None and not summary_error:
+        summary_error = "RuntimeError: summary generation did not produce artifacts"
+
     trace.record(
         stage="opensearch",
         service="opensearch",
@@ -488,6 +508,7 @@ async def run_pdf_pipeline(
         is_partial_run=manifest.is_partial_run,
         summary_path=summary_path.as_posix() if summary_path else None,
         citation_index_path=citation_index_path.as_posix() if citation_index_path else None,
+        citation_instances_path=citation_instances_path.as_posix() if citation_instances_path else None,
         resolved_citations_path=resolved_citations_path.as_posix() if resolved_citations_path else None,
         source_pdf_copy_path=source_pdf_copy_path.as_posix() if source_pdf_copy_path else None,
         summary=summary,

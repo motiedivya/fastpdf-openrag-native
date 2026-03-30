@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .models import PageMapSummary, SummaryScope
 
 
@@ -117,12 +119,9 @@ def build_truth_layer_prompt(
 ) -> str:
     metadata_hints = metadata_hints or {}
     rendered_summary = supported_summary.strip() or "No supported summary was produced."
-    rendered_key_facts = "
-".join(f"- {item}" for item in supported_key_facts) or "- None"
-    rendered_verified = "
-".join(f"- {item}" for item in verified_sentences) or "- None"
-    metadata_block = "
-".join(
+    rendered_key_facts = "\n".join(f"- {item}" for item in supported_key_facts) or "- None"
+    rendered_verified = "\n".join(f"- {item}" for item in verified_sentences) or "- None"
+    metadata_block = "\n".join(
         f"- {label}: {value}"
         for label, value in (
             ("Service date hint", metadata_hints.get("service_date") or ""),
@@ -185,3 +184,51 @@ Return valid JSON only with this shape:
   "residual_supported_facts": ["..."]
 }}
 """.strip()
+
+
+def build_presentation_layer_prompt(
+    scope: SummaryScope,
+    *,
+    truth_payload: dict[str, object],
+    candidate_sections: list[dict[str, object]],
+) -> str:
+    rendered_truth = json.dumps(truth_payload, ensure_ascii=True, indent=2)
+    rendered_candidates = json.dumps(candidate_sections, ensure_ascii=True, indent=2)
+    return f"""
+You are a presentation-layer renderer for a grounded medical/legal summarization pipeline.
+
+Scope title: {scope.title}
+Scope objective: {scope.objective}
+
+Use only the verified truth-layer JSON and candidate fact inventory below.
+Do not retrieve any new evidence.
+Do not invent facts.
+Do not add citations, markdown, code fences, source filenames, or commentary.
+Return valid JSON only.
+Every rendered item must include one or more fact_ids drawn from the candidate inventory.
+You may reorder and combine candidate facts for readability, but you must not omit clinically or operationally meaningful populated fields.
+Skip empty fields.
+Use narrative prose, one section per note/date when possible.
+
+Truth layer JSON:
+{rendered_truth}
+
+Candidate presentation facts:
+{rendered_candidates}
+
+Return valid JSON only with this shape:
+{{
+  "title": "{scope.title}",
+  "narrative": "overall narrative text",
+  "sections": [
+    {{
+      "title": "On 09/12/2018",
+      "note_id": "note-001",
+      "items": [
+        {{"text": "Sentence text.", "fact_ids": ["note-001__intro__01", "note-001__chief_complaint__01"]}}
+      ]
+    }}
+  ]
+}}
+""".strip()
+

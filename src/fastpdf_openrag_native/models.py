@@ -290,6 +290,8 @@ class PresentationItem(BaseModel):
     text: str
     field_name: str | None = None
     note_id: str | None = None
+    fact_ids: list[str] = Field(default_factory=list)
+    rendered_by_model: bool = False
     evidence: list[EvidenceHit] = Field(default_factory=list)
     candidate_filenames: list[str] = Field(default_factory=list)
     pdf_ids: list[str] = Field(default_factory=list)
@@ -346,10 +348,18 @@ class CitationIndexEntry(BaseModel):
     degraded_reason: str | None = None
 
 
+class CitationInstance(CitationIndexEntry):
+    sentence_id: str
+    sentence_text: str
+    primary_evidence_id: str | None = None
+    secondary_evidence_ids: list[str] = Field(default_factory=list)
+
+
 class CitationSentenceItem(BaseModel):
     item_id: str
     text: str
     citation_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
     supported: bool | None = None
     degraded: bool = False
     degraded_reason: str | None = None
@@ -383,9 +393,10 @@ class CitationSourcePage(BaseModel):
 
 
 class ResolvedCitations(BaseModel):
-    version: str = "citation_v1"
+    version: str = "citation_v2"
     generated_at: datetime = Field(default_factory=utc_now)
     citation_index: list[CitationIndexEntry] = Field(default_factory=list)
+    citation_instances: list[CitationInstance] = Field(default_factory=list)
     sections: list[CitationSection] = Field(default_factory=list)
     source_pages: list[CitationSourcePage] = Field(default_factory=list)
     debug: dict[str, Any] = Field(default_factory=dict)
@@ -407,6 +418,7 @@ class ScopedSummaryResult(BaseModel):
     validation_layer: ValidationLayer | None = None
     presentation_layer: PresentationLayer | None = None
     citation_index: list[CitationIndexEntry] = Field(default_factory=list)
+    citation_instances: list[CitationInstance] = Field(default_factory=list)
     resolved_citations: ResolvedCitations | None = None
     debug: dict[str, Any] = Field(default_factory=dict)
 
@@ -552,6 +564,7 @@ class PdfPipelineResult(BaseModel):
     is_partial_run: bool = False
     summary_path: str | None = None
     citation_index_path: str | None = None
+    citation_instances_path: str | None = None
     resolved_citations_path: str | None = None
     source_pdf_copy_path: str | None = None
     summary: ScopedSummaryResult | None = None

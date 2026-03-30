@@ -183,18 +183,20 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 def test_ensure_summary_citations_writes_artifacts_and_grounding(tmp_path: Path) -> None:
     manifest_path, summary_path, source_pdf, extraction_dir = _write_fixture(tmp_path)
 
-    summary, citation_index_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
+    summary, citation_index_path, citation_instances_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
         summary_path=summary_path,
         manifest_path=manifest_path,
         source_pdf=source_pdf,
     )
 
     assert citation_index_path.exists()
+    assert citation_instances_path.exists()
     assert resolved_citations_path.exists()
     assert source_pdf_copy_path == extraction_dir / "artifacts" / source_pdf.name
     assert source_pdf_copy_path.exists()
     assert summary.resolved_citations is not None
     assert summary.citation_index
+    assert summary.citation_instances
 
     first = summary.citation_index[0]
     assert first.chunk_id == "run-1__p0001__c0001.md"
@@ -207,13 +209,69 @@ def test_ensure_summary_citations_writes_artifacts_and_grounding(tmp_path: Path)
 
     persisted_summary = ScopedSummaryResult.model_validate_json(summary_path.read_text(encoding="utf-8"))
     assert persisted_summary.citation_index == summary.citation_index
+    assert persisted_summary.citation_instances == summary.citation_instances
     persisted_index = json.loads(citation_index_path.read_text(encoding="utf-8"))
+    persisted_instances = json.loads(citation_instances_path.read_text(encoding="utf-8"))
     assert [row["number"] for row in persisted_index] == list(range(1, len(persisted_index) + 1))
+    assert [row["number"] for row in persisted_instances] == list(range(1, len(persisted_instances) + 1))
+    assert len(persisted_instances) >= 2
+    assert len(persisted_instances) >= len(persisted_index)
     persisted_resolved = json.loads(resolved_citations_path.read_text(encoding="utf-8"))
     section_kinds = {section["kind"] for section in persisted_resolved["sections"]}
     assert {"supported_summary", "chronology", "page_summary", "key_facts", "draft_summary", "unsupported_summary"} <= section_kinds
     draft_section = next(section for section in persisted_resolved["sections"] if section["kind"] == "draft_summary")
     assert len(draft_section["items"]) == 2
+
+
+def test_ensure_summary_citations_prefers_presentation_layer_sections(tmp_path: Path) -> None:
+    manifest_path, summary_path, source_pdf, _extraction_dir = _write_fixture(tmp_path)
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    payload["presentation_layer"] = {
+        "title": "All Pages Summary",
+        "narrative": "On 09/12/2018, the procedure note documented page 1 findings.",
+        "sections": [
+            {
+                "section_id": "presentation-001",
+                "title": "09/12/2018",
+                "note_id": "note-001",
+                "items": [
+                    {
+                        "item_id": "note-001__intro__01",
+                        "text": "On 09/12/2018, the procedure note documented page 1 findings.",
+                        "field_name": "intro",
+                        "note_id": "note-001",
+                        "evidence": [
+                            {
+                                "filename": "run-1__p0001__c0001.md",
+                                "text": "Procedure note on page 1. Local anesthetic was used.",
+                                "score": 0.91,
+                                "page": 1,
+                            }
+                        ],
+                        "candidate_filenames": ["run-1__p0001__c0001.md"],
+                        "pdf_ids": ["run-1-pdf"],
+                        "pages": [1],
+                    }
+                ],
+            }
+        ],
+        "debug": {"note_count": 1},
+    }
+    payload["verified_sentences"] = []
+    payload["chronology"] = []
+    summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    summary, _citation_index_path, _citation_instances_path, _resolved_citations_path, _source_pdf_copy_path = ensure_summary_citations(
+        summary_path=summary_path,
+        manifest_path=manifest_path,
+        source_pdf=source_pdf,
+    )
+
+    assert summary.resolved_citations is not None
+    kinds = [section.kind for section in summary.resolved_citations.sections]
+    assert "supported_summary" in kinds
+    assert "page_summary" not in kinds
+    assert summary.resolved_citations.sections[0].items[0].text.startswith("On 09/12/2018")
 
 
 def test_build_summary_view_model_exposes_citation_urls_and_numbers(tmp_path: Path, monkeypatch) -> None:
@@ -240,6 +298,7 @@ def test_build_summary_view_model_exposes_citation_urls_and_numbers(tmp_path: Pa
     assert model["urls"]["resolved_citations"] == "/debug/resolved_citations.json"
     assert model["urls"]["source_pdf"] == "/debug/source.pdf"
     assert payload["citation_index_path"].endswith("citation_index.json")
+    assert payload["citation_instances_path"].endswith("sentence_citation_instances.json")
     assert payload["resolved_citations_path"].endswith("resolved_citations.json")
     assert payload["source_pdf_copy_path"].endswith("source.pdf")
 
@@ -249,8 +308,9 @@ def test_build_summary_view_model_exposes_citation_urls_and_numbers(tmp_path: Pa
         for item in section.get("items", [])
         for number in item.get("citation_numbers", [])
     }
-    assert citation_numbers == set(range(1, len(model["citation_index"]) + 1))
-    assert all(entry["page_image_url"] == "/debug/run-1__p0001.png" for entry in model["citation_index"])
+    assert citation_numbers == set(range(1, len(model["citation_instances"]) + 1))
+    assert all(entry["page_image_url"] == "/debug/run-1__p0001.png" for entry in model["citation_instances"])
     assert model["artifacts"]["citation_index"]["url"] == "/debug/citation_index.json"
+    assert model["artifacts"]["citation_instances"]["url"] == "/debug/sentence_citation_instances.json"
     assert model["artifacts"]["resolved_citations"]["url"] == "/debug/resolved_citations.json"
     assert model["artifacts"]["source_pdf_copy"]["url"] == "/debug/source.pdf"

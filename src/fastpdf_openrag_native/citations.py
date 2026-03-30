@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from .models import (
     CitationBox,
     CitationIndexEntry,
+    CitationInstance,
     CitationSection,
     CitationSentenceItem,
     CitationSourcePage,
@@ -432,8 +433,34 @@ def _build_sections(
     manifest_pages = {(page.pdf_id, page.page): page for page in manifest.page_documents}
     default_pdf_id = manifest.page_documents[0].pdf_id if manifest.page_documents else None
     scoped_sources = list(summary.source_filenames)
+    presentation_used = bool(summary.presentation_layer and summary.presentation_layer.sections)
 
-    if summary.verified_sentences:
+    if presentation_used:
+        for rendered_section in summary.presentation_layer.sections:
+            section = CitationSection(
+                section_id=rendered_section.section_id,
+                title=rendered_section.title,
+                kind="supported_summary",
+            )
+            items: list[_GroundingItem] = []
+            for rendered_item in rendered_section.items:
+                item_pdf_id = rendered_item.pdf_ids[0] if rendered_item.pdf_ids else default_pdf_id
+                item_page = rendered_item.pages[0] if rendered_item.pages else None
+                items.extend(
+                    _expand_text_items(
+                        section_id=section.section_id,
+                        values=[rendered_item.text],
+                        candidate_filenames=list(rendered_item.candidate_filenames or scoped_sources),
+                        default_pdf_id=item_pdf_id,
+                        default_page=item_page,
+                        supported=True,
+                        preferred_filenames=[hit.filename for hit in rendered_item.evidence],
+                    )
+                )
+            if items:
+                sections.append((section, items))
+
+    if not presentation_used and summary.verified_sentences:
         section = CitationSection(section_id="supported-summary", title="Supported Summary", kind="supported_summary")
         items = _expand_verified_items(
             section_id=section.section_id,
@@ -444,7 +471,7 @@ def _build_sections(
         if items:
             sections.append((section, items))
 
-    if summary.chronology:
+    if not presentation_used and summary.chronology:
         section = CitationSection(section_id="chronology", title="Chronology", kind="chronology")
         items: list[_GroundingItem] = []
         for item in _expand_text_items(
@@ -459,7 +486,7 @@ def _build_sections(
         if items:
             sections.append((section, items))
 
-    for page_summary in sorted(summary.page_summaries, key=lambda row: (row.pdf_id, row.page)):
+    for page_summary in ([] if presentation_used else sorted(summary.page_summaries, key=lambda row: (row.pdf_id, row.page))):
         page_key = (page_summary.pdf_id, page_summary.page)
         candidate_filenames = page_source_map.get(page_key, [])
         page_title = f"Page {page_summary.page} Summary"
@@ -908,7 +935,7 @@ def _ground_item(
     return citation, debug
 
 
-def _register_citation(
+def _register_evidence(
     citation: CitationIndexEntry,
     *,
     citation_lookup: dict[str, CitationIndexEntry],
@@ -921,6 +948,53 @@ def _register_citation(
     citation_lookup[numbered.id] = numbered
     citation_order.append(numbered)
     return numbered
+
+
+def _citation_instance_id(*, item_id: str, evidence_id: str | None, sentence_text: str) -> str:
+    raw = "|".join([item_id, evidence_id or "", _truncate_snippet(sentence_text, limit=180)])
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"citeinst-{digest}"
+
+
+def _build_citation_instance(
+    *,
+    item: _GroundingItem,
+    sentence_text: str,
+    evidence: CitationIndexEntry,
+    number: int,
+    secondary_evidence_ids: list[str] | None = None,
+) -> CitationInstance:
+    return CitationInstance(
+        id=_citation_instance_id(item_id=item.item_id, evidence_id=evidence.id, sentence_text=sentence_text),
+        number=number,
+        chunk_id=evidence.chunk_id,
+        label=evidence.label,
+        pdf_id=evidence.pdf_id,
+        page=evidence.page,
+        snippet=evidence.snippet,
+        anchor=evidence.anchor,
+        page_key=evidence.page_key,
+        source_filename=evidence.source_filename,
+        page_source_filename=evidence.page_source_filename,
+        page_image_path=evidence.page_image_path,
+        source_pdf_path=evidence.source_pdf_path,
+        page_width=evidence.page_width,
+        page_height=evidence.page_height,
+        block_start=evidence.block_start,
+        block_end=evidence.block_end,
+        paragraph_start=evidence.paragraph_start,
+        paragraph_end=evidence.paragraph_end,
+        page_paragraph_start=evidence.page_paragraph_start,
+        page_paragraph_end=evidence.page_paragraph_end,
+        bbox=dict(evidence.bbox),
+        boxes=list(evidence.boxes),
+        degraded=evidence.degraded,
+        degraded_reason=evidence.degraded_reason,
+        sentence_id=item.item_id,
+        sentence_text=sentence_text,
+        primary_evidence_id=evidence.id,
+        secondary_evidence_ids=list(secondary_evidence_ids or []),
+    )
 
 
 def build_resolved_citations(
@@ -942,6 +1016,7 @@ def build_resolved_citations(
 
     citation_lookup: dict[str, CitationIndexEntry] = {}
     citation_order: list[CitationIndexEntry] = []
+    citation_instances: list[CitationInstance] = []
     resolved_sections: list[CitationSection] = []
     strategy_counts: dict[str, int] = {}
 
@@ -956,16 +1031,25 @@ def build_resolved_citations(
                 page_sources=page_sources,
             )
             if citation is not None:
-                registered = _register_citation(citation, citation_lookup=citation_lookup, citation_order=citation_order)
-                citation_ids = [registered.id]
+                registered = _register_evidence(citation, citation_lookup=citation_lookup, citation_order=citation_order)
+                instance = _build_citation_instance(
+                    item=item,
+                    sentence_text=item.text,
+                    evidence=registered,
+                    number=len(citation_instances) + 1,
+                )
+                citation_instances.append(instance)
+                citation_ids = [instance.id]
+                evidence_ids = [registered.id]
                 strategy = debug.get("match_strategy") or "unknown"
                 strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
-                degraded = registered.degraded
-                degraded_reason = registered.degraded_reason
-                pdf_id = registered.pdf_id
-                page = registered.page
+                degraded = instance.degraded
+                degraded_reason = instance.degraded_reason
+                pdf_id = instance.pdf_id
+                page = instance.page
             else:
                 citation_ids = []
+                evidence_ids = []
                 degraded = True
                 degraded_reason = debug.get("match_strategy") or "no_citation"
                 pdf_id = item.expected_pdf_id
@@ -975,6 +1059,7 @@ def build_resolved_citations(
                     item_id=item.item_id,
                     text=item.text,
                     citation_ids=citation_ids,
+                    evidence_ids=evidence_ids,
                     supported=item.supported,
                     degraded=degraded,
                     degraded_reason=degraded_reason,
@@ -988,18 +1073,21 @@ def build_resolved_citations(
 
     resolved = ResolvedCitations(
         citation_index=list(citation_order),
+        citation_instances=list(citation_instances),
         sections=resolved_sections,
         source_pages=source_pages,
         debug={
             "grounding_backend": "local_manifest_chunk_matcher",
             "section_count": len(resolved_sections),
-            "citation_count": len(citation_order),
+            "citation_count": len(citation_instances),
+            "evidence_catalog_count": len(citation_order),
             "strategy_counts": strategy_counts,
         },
     )
     summary_with_citations = summary.model_copy(
         update={
             "citation_index": list(citation_order),
+            "citation_instances": list(citation_instances),
             "resolved_citations": resolved,
         }
     )
@@ -1013,12 +1101,13 @@ def ensure_summary_citations(
     source_pdf: Path | None = None,
     summary: ScopedSummaryResult | None = None,
     manifest: MaterializationManifest | None = None,
-) -> tuple[ScopedSummaryResult, Path, Path, Path | None]:
+) -> tuple[ScopedSummaryResult, Path, Path, Path, Path | None]:
     resolved_summary = summary or ScopedSummaryResult.model_validate_json(summary_path.read_text(encoding="utf-8"))
     resolved_manifest = manifest or MaterializationManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     extraction_dir = manifest_path.parent.resolve()
     output_dir = summary_path.parent.resolve()
     citation_index_path = output_dir / "citation_index.json"
+    citation_instances_path = output_dir / "sentence_citation_instances.json"
     resolved_citations_path = output_dir / "resolved_citations.json"
 
     summary_with_citations, resolved_citations, source_pdf_copy_path = build_resolved_citations(
@@ -1041,5 +1130,18 @@ def ensure_summary_citations(
         ),
         encoding="utf-8",
     )
+    citation_instances_path.write_text(
+        "\n".join(
+            [
+                "[",
+                *[
+                    entry.model_dump_json(indent=2) + ("," if index < len(summary_with_citations.citation_instances) - 1 else "")
+                    for index, entry in enumerate(summary_with_citations.citation_instances)
+                ],
+                "]",
+            ]
+        ),
+        encoding="utf-8",
+    )
     resolved_citations_path.write_text(resolved_citations.model_dump_json(indent=2), encoding="utf-8")
-    return summary_with_citations, citation_index_path, resolved_citations_path, source_pdf_copy_path
+    return summary_with_citations, citation_index_path, citation_instances_path, resolved_citations_path, source_pdf_copy_path

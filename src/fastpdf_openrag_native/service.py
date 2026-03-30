@@ -19,7 +19,7 @@ from .fastpdf_loader import load_run_from_mongo, load_run_json, materialize_summ
 from .langflow import LangflowGateway
 from .openrag import OpenRAGGateway
 from .opensearch import OpenSearchInspector
-from .pdf_workflow import run_pdf_pipeline
+from .pdf_workflow import _all_pages_scope, run_pdf_pipeline
 from .settings import fresh_settings
 from .summarizer import load_manifest, load_scopes, resolve_scope_pages, resolve_scope_retrieval_sources, summarize_scope
 
@@ -33,7 +33,118 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/debug-data", StaticFiles(directory=DATA_ROOT.as_posix()), name="debug-data")
 app.mount("/debug-outputs", StaticFiles(directory=OUTPUT_ROOT.as_posix()), name="debug-outputs")
 
+UI_JOBS_PATH = Path("/tmp/fastpdf-ui-jobs.json")
 _jobs: dict[str, dict[str, Any]] = {}
+
+
+def _load_jobs_from_store() -> None:
+    if not UI_JOBS_PATH.exists():
+        return
+    try:
+        payload = json.loads(UI_JOBS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return
+    for row in runs:
+        if not isinstance(row, dict):
+            continue
+        job_id = str(row.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        cached = _jobs.setdefault(job_id, {"job_id": job_id, "status": row.get("status", "queued")})
+        cached.update(row)
+
+
+def _persist_jobs_to_store() -> None:
+    UI_JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    serializable_runs = [dict(row) for row in _jobs.values()]
+    UI_JOBS_PATH.write_text(json.dumps({"runs": serializable_runs}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _format_exception_message(exc: BaseException, *, fallback: str = "summary generation failed") -> str:
+    detail = str(exc).strip()
+    error_type = type(exc).__name__
+    if detail:
+        if detail.startswith(f"{error_type}:"):
+            return detail
+        return f"{error_type}: {detail}"
+    return f"{error_type}: {fallback}"
+
+
+def _candidate_path(path: Path) -> str | None:
+    return path.as_posix() if path.exists() else None
+
+
+def _recover_job_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
+    hydrated = dict(payload)
+    result_payload = hydrated.get("result") if isinstance(hydrated.get("result"), dict) else {}
+    for key in (
+        "run_id",
+        "extraction_dir",
+        "trace_dir",
+        "trace_path",
+        "trace_summary_path",
+        "chunk_dump_dir",
+        "manifest_path",
+        "summary_path",
+        "citation_index_path",
+        "citation_instances_path",
+        "resolved_citations_path",
+        "source_pdf_copy_path",
+        "summary_error",
+    ):
+        if hydrated.get(key) in (None, "") and result_payload.get(key) not in (None, ""):
+            hydrated[key] = result_payload.get(key)
+    if hydrated.get("pdf_path") in (None, "") and result_payload.get("source_pdf") not in (None, ""):
+        hydrated["pdf_path"] = result_payload.get("source_pdf")
+
+    run_id = str(hydrated.get("run_id") or "").strip()
+    if run_id:
+        extraction_dir = _normalize_repo_path(str(hydrated.get("extraction_dir") or ""))
+        if extraction_dir is None:
+            inferred_extraction_dir = DATA_ROOT / "extracted" / run_id
+            if inferred_extraction_dir.exists():
+                extraction_dir = inferred_extraction_dir
+                hydrated["extraction_dir"] = extraction_dir.as_posix()
+        if extraction_dir is not None:
+            if not hydrated.get("manifest_path"):
+                hydrated["manifest_path"] = _candidate_path(extraction_dir / "manifest.json")
+            artifacts_dir = extraction_dir / "artifacts"
+            if not hydrated.get("source_pdf_copy_path") and artifacts_dir.exists():
+                pdf_candidates = sorted(artifacts_dir.glob("*.pdf"))
+                if pdf_candidates:
+                    hydrated["source_pdf_copy_path"] = pdf_candidates[0].as_posix()
+        trace_dir = _normalize_repo_path(str(hydrated.get("trace_dir") or ""))
+        if trace_dir is None:
+            inferred_trace_dir = OUTPUT_ROOT / "traces" / run_id
+            if inferred_trace_dir.exists():
+                trace_dir = inferred_trace_dir
+                hydrated["trace_dir"] = trace_dir.as_posix()
+        if trace_dir is not None:
+            if not hydrated.get("trace_path"):
+                hydrated["trace_path"] = _candidate_path(trace_dir / "events.jsonl")
+            if not hydrated.get("trace_summary_path"):
+                hydrated["trace_summary_path"] = _candidate_path(trace_dir / "summary.json")
+            if not hydrated.get("chunk_dump_dir"):
+                hydrated["chunk_dump_dir"] = _candidate_path(trace_dir / "chunks")
+        run_output_dir = OUTPUT_ROOT / run_id
+        if run_output_dir.exists():
+            if not hydrated.get("summary_path"):
+                hydrated["summary_path"] = _candidate_path(run_output_dir / "all-pages.summary.json")
+            if not hydrated.get("citation_index_path"):
+                hydrated["citation_index_path"] = _candidate_path(run_output_dir / "citation_index.json")
+            if not hydrated.get("citation_instances_path"):
+                hydrated["citation_instances_path"] = _candidate_path(run_output_dir / "sentence_citation_instances.json")
+            if not hydrated.get("resolved_citations_path"):
+                hydrated["resolved_citations_path"] = _candidate_path(run_output_dir / "resolved_citations.json")
+
+    hydrated["debug_artifacts"] = _job_debug_artifacts(hydrated)
+    return hydrated
+
+
+_load_jobs_from_store()
 
 
 class MaterializeRequest(BaseModel):
@@ -63,14 +174,21 @@ class FlowUpgradeRequest(BaseModel):
 
 
 def _job_payload(job_id: str) -> dict[str, Any]:
+    _load_jobs_from_store()
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="job not found")
+    hydrated = _recover_job_artifacts(_jobs[job_id])
+    if hydrated != _jobs[job_id]:
+        _jobs[job_id] = hydrated
+        _persist_jobs_to_store()
     return _jobs[job_id]
 
 
 def _set_job(job_id: str, **fields: Any) -> None:
     payload = _jobs.setdefault(job_id, {"job_id": job_id, "status": "queued"})
     payload.update(fields)
+    _jobs[job_id] = _recover_job_artifacts(payload)
+    _persist_jobs_to_store()
 
 
 def _settings():
@@ -122,6 +240,7 @@ def _job_debug_artifacts(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         "trace_dir": trace_dir,
         "chunk_dump_dir": payload.get("chunk_dump_dir"),
         "citation_index": payload.get("citation_index_path"),
+        "citation_instances": payload.get("citation_instances_path"),
         "resolved_citations": payload.get("resolved_citations_path"),
         "source_pdf_copy": payload.get("source_pdf_copy_path"),
     }
@@ -138,6 +257,78 @@ def _job_debug_artifacts(payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         if debug_url:
             artifact_links[label]["url"] = debug_url
     return artifact_links
+
+
+async def _backfill_summary_artifacts(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    recovered = _recover_job_artifacts(payload)
+    summary_path = _normalize_repo_path(recovered.get("summary_path"))
+    manifest_path = _normalize_repo_path(recovered.get("manifest_path"))
+    status = str(recovered.get("status") or "").strip()
+    if summary_path and summary_path.exists():
+        return recovered
+    if status not in {"completed", "completed_with_errors"}:
+        return recovered
+    if manifest_path is None or not manifest_path.exists():
+        return recovered
+
+    run_id = str(recovered.get("run_id") or "").strip()
+    if not run_id:
+        return recovered
+
+    settings = _settings()
+    gateway = OpenRAGGateway(settings)
+    output_dir = OUTPUT_ROOT / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = output_dir / "all-pages.summary.json"
+
+    try:
+        manifest = load_manifest(manifest_path)
+        scope = _all_pages_scope(manifest, objective=recovered.get("question") or None)
+        summary = await summarize_scope(
+            gateway,
+            manifest=manifest,
+            scope=scope,
+            settings=settings,
+        )
+        summary_file.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+        summary, citation_index_path, citation_instances_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
+            summary_path=summary_file,
+            manifest_path=manifest_path,
+            source_pdf=_normalize_repo_path(recovered.get("pdf_path")),
+            summary=summary,
+            manifest=manifest,
+        )
+        recovered["summary_path"] = summary_file.as_posix()
+        recovered["citation_index_path"] = citation_index_path.as_posix()
+        recovered["citation_instances_path"] = citation_instances_path.as_posix()
+        recovered["resolved_citations_path"] = resolved_citations_path.as_posix()
+        recovered["source_pdf_copy_path"] = source_pdf_copy_path.as_posix() if source_pdf_copy_path else None
+        recovered["summary_error"] = None
+        recovered["status"] = "completed"
+        result_payload = recovered.get("result") if isinstance(recovered.get("result"), dict) else {}
+        result_payload.update(
+            {
+                "summary_path": recovered["summary_path"],
+                "citation_index_path": recovered["citation_index_path"],
+                "citation_instances_path": recovered["citation_instances_path"],
+                "resolved_citations_path": recovered["resolved_citations_path"],
+                "source_pdf_copy_path": recovered["source_pdf_copy_path"],
+                "summary_error": None,
+            }
+        )
+        recovered["result"] = result_payload
+    except Exception as exc:
+        formatted_error = _format_exception_message(exc)
+        recovered["summary_error"] = formatted_error
+        recovered["status"] = "completed_with_errors"
+        result_payload = recovered.get("result") if isinstance(recovered.get("result"), dict) else {}
+        result_payload["summary_error"] = formatted_error
+        recovered["result"] = result_payload
+
+    recovered = _recover_job_artifacts(recovered)
+    _jobs[job_id] = recovered
+    _persist_jobs_to_store()
+    return recovered
 
 
 async def _run_job(
@@ -188,6 +379,7 @@ async def _run_job(
         manifest_path=result.manifest_path,
         summary_path=result.summary_path,
         citation_index_path=result.citation_index_path,
+        citation_instances_path=result.citation_instances_path,
         resolved_citations_path=result.resolved_citations_path,
         source_pdf_copy_path=result.source_pdf_copy_path,
         summary_error=result.summary_error,
@@ -196,7 +388,8 @@ async def _run_job(
 
 
 def _render_home() -> str:
-    jobs = sorted(_jobs.values(), key=lambda row: row.get("job_id", ""), reverse=True)
+    _load_jobs_from_store()
+    jobs = sorted((_recover_job_artifacts(row) for row in _jobs.values()), key=lambda row: row.get("job_id", ""), reverse=True)
     job_rows = "\n".join(
         (
             "<tr>"
@@ -295,6 +488,7 @@ def _render_home() -> str:
 
 
 def _render_trace_page(job_id: str, payload: dict[str, Any]) -> str:
+    payload = _recover_job_artifacts(payload)
     trace_summary_path = _normalize_repo_path(payload.get("trace_summary_path"))
     events_path = _normalize_repo_path(payload.get("trace_path"))
     pipeline_summary_path = _normalize_repo_path(payload.get("summary_path"))
@@ -475,43 +669,78 @@ def _merge_sections_for_display(sections: list[dict[str, Any]]) -> list[dict[str
 
 
 def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    recovered_payload = _recover_job_artifacts(payload)
+    payload.update(recovered_payload)
     summary_path = _normalize_repo_path(payload.get("summary_path"))
     manifest_path = _normalize_repo_path(payload.get("manifest_path"))
+    summary_error = str(payload.get("summary_error") or "").strip()
     if summary_path is None or manifest_path is None:
+        if summary_error:
+            raise HTTPException(status_code=500, detail=summary_error)
         raise HTTPException(status_code=409, detail="summary artifacts are not available for this job yet")
     if not summary_path.exists():
+        if summary_error:
+            raise HTTPException(status_code=500, detail=summary_error)
         raise HTTPException(status_code=404, detail=f"summary not found: {summary_path}")
     if not manifest_path.exists():
         raise HTTPException(status_code=404, detail=f"manifest not found: {manifest_path}")
 
     source_pdf = _normalize_repo_path(payload.get("pdf_path"))
-    summary, citation_index_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
+    summary, citation_index_path, citation_instances_path, resolved_citations_path, source_pdf_copy_path = ensure_summary_citations(
         summary_path=summary_path,
         manifest_path=manifest_path,
         source_pdf=source_pdf,
     )
 
     payload["citation_index_path"] = citation_index_path.as_posix()
+    payload["citation_instances_path"] = citation_instances_path.as_posix()
     payload["resolved_citations_path"] = resolved_citations_path.as_posix()
     if source_pdf_copy_path:
         payload["source_pdf_copy_path"] = source_pdf_copy_path.as_posix()
     payload["debug_artifacts"] = _job_debug_artifacts(payload)
 
-    citation_lookup = {entry.id: entry for entry in summary.citation_index}
-    citation_index = []
+    evidence_catalog = []
     for entry in summary.citation_index:
         row = entry.model_dump(mode="json")
         row["page_image_url"] = _debug_url_for_path(row.get("page_image_path"))
         row["source_pdf_url"] = _debug_url_for_path(row.get("source_pdf_path"))
-        citation_index.append(row)
+        evidence_catalog.append(row)
+
+    citation_instances = []
+    display_citations = list(summary.citation_instances or summary.citation_index)
+    citation_lookup = {entry.id: entry for entry in display_citations}
+    for entry in display_citations:
+        row = entry.model_dump(mode="json")
+        row["page_image_url"] = _debug_url_for_path(row.get("page_image_path"))
+        row["source_pdf_url"] = _debug_url_for_path(row.get("source_pdf_path"))
+        citation_instances.append(row)
 
     resolved = summary.resolved_citations.model_dump(mode="json") if summary.resolved_citations else {"sections": [], "source_pages": []}
-    for section in resolved.get("sections", []):
+    merged_sections = _merge_sections_for_display(list(resolved.get("sections", [])))
+    visible_citation_ids: list[str] = []
+    seen_visible_ids: set[str] = set()
+    for section in merged_sections:
+        for item in section.get("items", []):
+            for citation_id in item.get("citation_ids", []):
+                if citation_id in citation_lookup and citation_id not in seen_visible_ids:
+                    seen_visible_ids.add(citation_id)
+                    visible_citation_ids.append(citation_id)
+    visible_citation_lookup: dict[str, dict[str, Any]] = {}
+    renumbered_citation_instances: list[dict[str, Any]] = []
+    for number, citation_id in enumerate(visible_citation_ids, start=1):
+        source_entry = citation_lookup[citation_id]
+        row = source_entry.model_dump(mode="json")
+        row["number"] = number
+        row["page_image_url"] = _debug_url_for_path(row.get("page_image_path"))
+        row["source_pdf_url"] = _debug_url_for_path(row.get("source_pdf_path"))
+        visible_citation_lookup[citation_id] = row
+        renumbered_citation_instances.append(row)
+    for section in merged_sections:
         for item in section.get("items", []):
             item["citation_numbers"] = [
-                citation_lookup[citation_id].number
+                visible_citation_lookup[citation_id]["number"]
                 for citation_id in item.get("citation_ids", [])
-                if citation_id in citation_lookup
+                if citation_id in visible_citation_lookup
             ]
     for page in resolved.get("source_pages", []):
         page["image_url"] = _debug_url_for_path(page.get("image_path"))
@@ -531,8 +760,9 @@ def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str,
         "title": summary.draft_title or summary.scope.title,
         "scope": summary.scope.model_dump(mode="json"),
         "summary": summary.model_dump(mode="json"),
-        "citation_index": citation_index,
-        "sections": _merge_sections_for_display(list(resolved.get("sections", []))),
+        "citation_index": evidence_catalog,
+        "citation_instances": renumbered_citation_instances,
+        "sections": merged_sections,
         "source_pages": resolved.get("source_pages", []),
         "resolved_debug": resolved.get("debug", {}),
         "artifacts": payload.get("debug_artifacts", {}),
@@ -541,6 +771,7 @@ def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str,
             "trace": f"/ui/runs/{quote(job_id)}/trace",
             "summary_json": _debug_url_for_path(summary_path.as_posix()),
             "citation_index": _debug_url_for_path(citation_index_path.as_posix()),
+            "citation_instances": _debug_url_for_path(citation_instances_path.as_posix()),
             "resolved_citations": _debug_url_for_path(resolved_citations_path.as_posix()),
             "source_pdf": _debug_url_for_path(source_pdf_copy_path.as_posix()) if source_pdf_copy_path else None,
         },
@@ -1079,9 +1310,9 @@ def _render_summary_page(job_id: str) -> str:
         </div>
         <div class="chip-row">
           <button id="debug-toggle" class="toggle-chip" type="button" data-active="false">Debug</button>
-          <a id="status-link" class="link-chip" href="#">JSON Status</a>
-          <a id="trace-link" class="link-chip" href="#">Trace</a>
-          <a id="summary-json-link" class="link-chip" href="#">Summary JSON</a>
+          <a id="status-link" class="link-chip" href="/ui/runs/__JOB_ID_URL__">JSON Status</a>
+          <a id="trace-link" class="link-chip" href="/ui/runs/__JOB_ID_URL__/trace">Trace</a>
+          <a id="summary-json-link" class="link-chip" href="/ui/runs/__JOB_ID_URL__/summary-data">Summary JSON</a>
         </div>
       </div>
       <div id="status-banner" class="status-banner" hidden></div>
@@ -1557,7 +1788,7 @@ def _render_summary_page(job_id: str) -> str:
         state.citationById = new Map();
         state.citationByNumber = new Map();
         state.pageByKey = new Map();
-        (model.citation_index || []).forEach((citation) => {
+        (model.citation_instances || model.citation_index || []).forEach((citation) => {
           state.citationById.set(String(citation.id), citation);
           state.citationByNumber.set(Number(citation.number), citation);
         });
@@ -1584,8 +1815,8 @@ def _render_summary_page(job_id: str) -> str:
           const item = (model.sections || []).flatMap((section) => section.items || []).find((row) => (row.citation_ids || []).includes(citation.id));
           state.activeItemId = item?.item_id || null;
           activateCitation(citation.id, state.activeItemId);
-        } else if ((model.citation_index || []).length) {
-          const first = model.citation_index[0];
+        } else if (((model.citation_instances || model.citation_index || [])).length) {
+          const first = (model.citation_instances || model.citation_index || [])[0];
           const item = (model.sections || []).flatMap((section) => section.items || []).find((row) => (row.citation_ids || []).includes(first.id));
           state.activeItemId = item?.item_id || null;
           activateCitation(first.id, state.activeItemId);
@@ -1606,7 +1837,7 @@ def _render_summary_page(job_id: str) -> str:
 </body>
 </html>
 """
-    return html_page.replace("__JOB_ID__", html.escape(job_id))
+    return html_page.replace("__JOB_ID__", html.escape(job_id)).replace("__JOB_ID_URL__", quote(job_id))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1719,7 +1950,9 @@ async def run_summary(request: ScopeRequest):
 
 @app.get("/ui/runs")
 async def list_ui_runs() -> dict[str, Any]:
-    return {"runs": list(_jobs.values())}
+    _load_jobs_from_store()
+    runs = [_job_payload(job_id) for job_id in sorted(_jobs.keys())]
+    return {"runs": runs}
 
 
 @app.post("/ui/runs")
@@ -1779,6 +2012,7 @@ async def get_ui_run(job_id: str) -> dict[str, Any]:
 @app.get("/ui/runs/{job_id}/summary-data")
 async def get_ui_summary_data(job_id: str) -> dict[str, Any]:
     payload = _job_payload(job_id)
+    payload = await _backfill_summary_artifacts(job_id, payload)
     return _build_summary_view_model(job_id, payload)
 
 

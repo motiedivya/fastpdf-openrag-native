@@ -7,24 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .models import (
-    TRUTH_FIELD_LABELS,
-    TRUTH_FIELD_NAMES,
-    MaterializationManifest,
-    NoteValidationLayer,
-    PageMapSummary,
-    PresentationItem,
-    PresentationLayer,
-    PresentationSection,
-    ScopedSummaryResult,
-    SummaryScope,
-    SupportedFact,
-    TruthLayerNote,
-    ValidationCheck,
-    ValidationLayer,
-    VerifiedSentence,
-)
-from .prompts import build_page_map_prompt, build_reduce_prompt, build_truth_layer_prompt
+from .layered_output import extract_truth_layer_note, group_truth_layer_notes, render_presentation_layer, validate_truth_layer
+from .models import MaterializationManifest, PageMapSummary, ScopedSummaryResult, SummaryScope, VerifiedSentence
+from .prompts import build_page_map_prompt, build_reduce_prompt
 from .reranking import RERANKER_TYPE, attach_rank_metadata, rerank_hits, select_top_source_filenames
 from .settings import AppSettings, get_settings
 
@@ -1468,6 +1453,53 @@ async def summarize_scope(
             supported_summary = scope_supported_fallback
             scope_supported_fallback_used = True
 
+    truth_page_inputs = [
+        (page, page_summary)
+        for page, page_summary in zip(pages, page_summaries, strict=False)
+        if page_summary.passed_verification and (page_summary.supported_summary or page_summary.supported_key_facts)
+    ]
+    truth_layer_pages = []
+    truth_layer_page_debug: list[dict[str, Any]] = []
+    if truth_page_inputs:
+        truth_layer_results = await asyncio.gather(
+            *(
+                extract_truth_layer_note(
+                    gateway,
+                    scope=scope,
+                    page=page,
+                    page_summary=page_summary,
+                    settings=effective_settings,
+                )
+                for page, page_summary in truth_page_inputs
+            )
+        )
+        truth_layer_pages = [row[0] for row in truth_layer_results]
+        truth_layer_page_debug = [row[1] for row in truth_layer_results]
+    truth_layer = group_truth_layer_notes(list(truth_layer_pages)) if truth_layer_pages else []
+    validation_layer = validate_truth_layer(list(truth_layer)) if truth_layer else None
+    presentation_layer = None
+    layered_output_used = False
+    layered_output_structured = any(
+        any(field_name != "residual_supported_facts" for field_name in note.populated_fields())
+        for note in truth_layer
+    )
+    if truth_layer:
+        presentation_candidate, presentation_verified_sentences, presentation_supported_summary = await render_presentation_layer(
+            gateway,
+            notes=list(truth_layer),
+            scope=scope,
+            settings=effective_settings,
+        )
+        presentation_layer = presentation_candidate
+        if (
+            layered_output_structured
+            and presentation_supported_summary
+            and (validation_layer is None or validation_layer.passed or not supported_summary)
+        ):
+            supported_summary = presentation_supported_summary
+            verified_sentences = presentation_verified_sentences
+            layered_output_used = True
+
     return ScopedSummaryResult(
         run_id=manifest.run_id,
         scope=scope,
@@ -1479,6 +1511,9 @@ async def summarize_scope(
         verified_sentences=list(verified_sentences),
         supported_summary=supported_summary,
         unsupported_sentences=unsupported_sentences,
+        truth_layer=list(truth_layer),
+        validation_layer=validation_layer,
+        presentation_layer=presentation_layer,
         debug={
             "page_requests": page_debug,
             "page_verification": page_verification_debug,
@@ -1511,5 +1546,12 @@ async def summarize_scope(
             "verification_reranker_type": _verification_reranker_type(effective_settings),
             "scope_supported_fallback": scope_supported_fallback,
             "scope_supported_fallback_used": scope_supported_fallback_used,
+            "truth_layer_pages": [row.model_dump(mode="json") for row in truth_layer_pages],
+            "truth_layer_page_debug": truth_layer_page_debug,
+            "truth_layer": [row.model_dump(mode="json") for row in truth_layer],
+            "validation_layer": validation_layer.model_dump(mode="json") if validation_layer else None,
+            "presentation_layer": presentation_layer.model_dump(mode="json") if presentation_layer else None,
+            "layered_output_used": layered_output_used,
+            "layered_output_structured": layered_output_structured,
         },
     )
