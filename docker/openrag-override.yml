@@ -9,6 +9,8 @@ services:
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_search.py:/app/src/api/v1/search.py:ro
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/session_manager.py:/app/src/session_manager.py:ro
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/sitecustomize.py:/app/src/sitecustomize.py:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
 
   langflow:
     environment:
@@ -17,3 +19,5 @@ services:
       - FASTPDF_OPENRAG_BACKEND_RERANK_MODEL=${FASTPDF_OPENRAG_BACKEND_RERANK_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
       - FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N=${FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N:-8}
       - COHERE_API_KEY=${COHERE_API_KEY:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway

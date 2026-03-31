@@ -38,6 +38,63 @@ export FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N="${FASTPDF_OPENRAG_BACKEND_RERANK_TO
 export FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED="${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED:-true}"
 export FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT="${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT:-24}"
 
+
+resolve_path() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    return 1
+  fi
+  if [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  path="${path#./}"
+  printf '%s\n' "$PACKAGE_ROOT/$path"
+}
+
+read_flow_id() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    return 1
+  fi
+  python3 - "$path" <<'PY2'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+value = data.get('id')
+if isinstance(value, str) and value.strip():
+    print(value.strip())
+PY2
+}
+
+set_env_if_unset() {
+  local name="$1"
+  local value="$2"
+  if [[ -n "${!name:-}" || -z "$value" ]]; then
+    return 0
+  fi
+  export "$name=$value"
+  printf '[info] auto-detected %s=%s\n' "$name" "$value"
+}
+
+auto_detect_flow_ids() {
+  local flows_root raw_root
+  raw_root="${OPENRAG_FLOWS_PATH:-./state/flows}"
+  flows_root="$(resolve_path "$raw_root")"
+  if [[ ! -d "$flows_root" ]]; then
+    printf '[warn] flow directory not found, skipping flow ID auto-detection: %s\n' "$flows_root" >&2
+    return 0
+  fi
+  set_env_if_unset LANGFLOW_CHAT_FLOW_ID "$(read_flow_id "$flows_root/openrag_agent.json" || true)"
+  set_env_if_unset LANGFLOW_INGEST_FLOW_ID "$(read_flow_id "$flows_root/ingestion_flow.json" || true)"
+  set_env_if_unset LANGFLOW_URL_INGEST_FLOW_ID "$(read_flow_id "$flows_root/openrag_url_mcp.json" || true)"
+  set_env_if_unset NUDGES_FLOW_ID "$(read_flow_id "$flows_root/openrag_nudges.json" || true)"
+  export FASTPDF_OPENRAG_LANGFLOW_FLOWS_ROOT="${FASTPDF_OPENRAG_LANGFLOW_FLOWS_ROOT:-$flows_root}"
+}
+
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 }
@@ -137,6 +194,7 @@ printf '[info] FASTPDF_OPENRAG_NATIVE_ROOT=%s
 ' "$FASTPDF_OPENRAG_NATIVE_ROOT"
 
 validate_native_root
+auto_detect_flow_ids
 restart_docling
 compose up -d --remove-orphans docling opensearch dashboards langflow openrag-backend openrag-frontend
 wait_for_http "http://127.0.0.1:${DOCLING_PORT:-5001}/health" "Docling" 90 2
