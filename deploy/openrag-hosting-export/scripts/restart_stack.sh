@@ -60,6 +60,48 @@ wait_for_http() {
   return 1
 }
 
+validate_native_root() {
+  local native_root="$FASTPDF_OPENRAG_NATIVE_ROOT"
+  local missing=0
+  local required=(
+    "$native_root/openrag-hotfixes/api_v1_chat.py"
+    "$native_root/openrag-hotfixes/api_v1_search.py"
+    "$native_root/openrag-hotfixes/session_manager.py"
+    "$native_root/scripts/restart_openrag_stack.sh"
+    "$native_root/pyproject.toml"
+  )
+
+  if [[ ! -d "$native_root" ]]; then
+    printf '[error] FASTPDF_OPENRAG_NATIVE_ROOT does not exist: %s
+' "$native_root" >&2
+    printf '[hint] It must point to the fastpdf-openrag-native repo root, not fastpdf/openrag_native_bridge.
+' >&2
+    return 1
+  fi
+
+  for path in "${required[@]}"; do
+    if [[ ! -f "$path" ]]; then
+      printf '[error] missing required native file: %s
+' "$path" >&2
+      missing=1
+    fi
+  done
+
+  if [[ "$native_root" == *"/openrag_native_bridge"* ]]; then
+    printf '[error] FASTPDF_OPENRAG_NATIVE_ROOT is pointing at openrag_native_bridge: %s
+' "$native_root" >&2
+    printf '[hint] Use the fastpdf-openrag-native checkout path instead.
+' >&2
+    missing=1
+  fi
+
+  if (( missing != 0 )); then
+    printf '[hint] Example: FASTPDF_OPENRAG_NATIVE_ROOT=/srv/fastpdf-openrag-native bash ./scripts/restart_stack.sh
+' >&2
+    return 1
+  fi
+}
+
 restart_docling() {
   local managed
   managed="$(printf '%s' "$DOCLING_MANAGED" | tr '[:upper:]' '[:lower:]')"
@@ -90,7 +132,10 @@ printf '[info] compose=%s
 ' "$COMPOSE_FILE"
 printf '[info] env=%s
 ' "$ENV_FILE"
+printf '[info] FASTPDF_OPENRAG_NATIVE_ROOT=%s
+' "$FASTPDF_OPENRAG_NATIVE_ROOT"
 
+validate_native_root
 restart_docling
 compose up -d --remove-orphans opensearch dashboards langflow openrag-backend openrag-frontend
 wait_for_http "http://127.0.0.1:${LANGFLOW_PORT:-7860}/health" "Langflow" 90 2

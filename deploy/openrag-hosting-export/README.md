@@ -69,6 +69,7 @@ cp .env.example .env
 ```
 
 Then edit `.env` and set at minimum:
+- `FASTPDF_OPENRAG_NATIVE_ROOT` must be the native repo root, for example `/srv/fastpdf-openrag-native`, not `/srv/fastpdf/openrag_native_bridge`
 - `FASTPDF_OPENRAG_NATIVE_ROOT`
 - `OPENSEARCH_PASSWORD`
 - `LANGFLOW_SECRET_KEY`
