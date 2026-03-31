@@ -178,6 +178,10 @@ class AppSettings(BaseSettings):
         default=180.0,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_INGEST_WAIT_TIMEOUT"),
     )
+    openrag_request_timeout: float = Field(
+        default=600.0,
+        validation_alias=AliasChoices("FASTPDF_OPENRAG_REQUEST_TIMEOUT"),
+    )
     extractor_llm_provider: str | None = Field(
         default=None,
         validation_alias=AliasChoices("FASTPDF_OPENRAG_EXTRACTOR_LLM_PROVIDER"),

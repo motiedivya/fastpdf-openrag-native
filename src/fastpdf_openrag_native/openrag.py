@@ -117,7 +117,7 @@ class OpenRAGGateway:
         return OpenRAGClient(
             api_key=self._resolve_api_key(),
             base_url=self.settings.openrag_url,
-            timeout=120.0,
+            timeout=float(self.settings.openrag_request_timeout),
         )
 
     @staticmethod
