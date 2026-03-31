@@ -27,6 +27,9 @@ INLINE_NOISE_PATTERNS = (
 )
 
 
+TEXT_PREVIEW_CHARS = 1200
+
+
 def _clean_scalar(value: Any) -> str:
     text = str(value or "")
     text = text.replace("\x00", " ")
@@ -102,12 +105,24 @@ def _extract_patient_name(payload: dict[str, Any]) -> str | None:
 
 
 def _extract_service_date(text: str) -> str | None:
-    for pattern in (
+    labeled_patterns = (
+        r"\b(?:date\s+of\s+service|service\s+date|dos)\s*[:#-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})\b",
+        r"\b(?:date\s+of\s+service|service\s+date|dos)\s*[:#-]?\s*(\d{4}-\d{2}-\d{2})\b",
+    )
+    for pattern in labeled_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    generic_patterns = (
         r"\b(\d{4}-\d{2}-\d{2})\b",
         r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b",
-    ):
-        match = re.search(pattern, text)
-        if match:
+    )
+    for pattern in generic_patterns:
+        for match in re.finditer(pattern, text):
+            context = text[max(0, match.start() - 32):match.start()].lower()
+            if re.search(r"\b(?:dob|date\s+of\s+birth|birth)\b", context):
+                continue
             return match.group(1)
     return None
 
@@ -298,7 +313,7 @@ def materialize_summary_payload(
                         source_filename=retrieval_filename,
                         relative_path=str(retrieval_path.relative_to(output_dir)),
                         text_length=len(chunk.text),
-                        text_preview=chunk.text[:220],
+                        text_preview=chunk.text[:TEXT_PREVIEW_CHARS],
                         parent_source_filename=filename,
                         section_title=chunk.section_title,
                         source_fields=list(source_fields),
@@ -322,7 +337,7 @@ def materialize_summary_payload(
                     service_date=service_date,
                     patient_name=patient_name,
                     text_length=len(text),
-                    text_preview=text[:220],
+                    text_preview=text[:TEXT_PREVIEW_CHARS],
                     source_fields=source_fields,
                     retrieval_filenames=retrieval_filenames,
                     retrieval_relative_paths=retrieval_relative_paths,

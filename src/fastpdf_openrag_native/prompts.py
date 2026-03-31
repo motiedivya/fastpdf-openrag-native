@@ -29,6 +29,7 @@ Indexed retrieval chunk files for this page: {retrieval_source_count}
 
 The relevant evidence is already indexed in OpenRAG and pre-filtered to this page's retrieval chunk file set.
 Use the OpenSearch Retrieval Tool now.
+If the Retrieval Tool returns no hits, you may use the local retrieval inventory below as trusted same-page fallback evidence.
 Do not ask for a URL, file upload, or pasted content.
 Use only the retrieved page evidence for {source_filename}.
 {source_hint_block}
@@ -50,7 +51,7 @@ Rules:
 - prefer specific indication/procedure/assessment/plan/callback/clearance/provider-action details over facility headers when both are present
 - ignore any retrieved result that does not belong to this page artifact or its retrieval chunk files
 - if the page is mostly demographic/header material, say that directly
-- if retrieval still fails, say that no supporting sources were found for this page
+- if both the Retrieval Tool and the local retrieval inventory are empty, say that no supporting sources were found for this page
 """.strip()
 
 
@@ -281,3 +282,51 @@ Return valid JSON only with this shape:
 }}
 """.strip()
 
+
+
+
+def build_page_local_fallback_prompt(
+    scope: SummaryScope,
+    *,
+    pdf_id: str,
+    page: int,
+    source_filename: str,
+    evidence_excerpts: list[str],
+) -> str:
+    rendered_excerpts = "\n\n".join(
+        f"Excerpt {index}:\n{excerpt}"
+        for index, excerpt in enumerate(evidence_excerpts, start=1)
+        if str(excerpt).strip()
+    ) or "No page-local excerpts were available."
+    return f"""
+You are summarizing a single page from an already materialized medical/legal document.
+
+Scope title: {scope.title}
+Scope objective: {scope.objective}
+Current page: {pdf_id} page {page}
+Page artifact filename: {source_filename}
+
+Use only the page-local evidence excerpts below.
+They were derived from this exact page during materialization and are allowed evidence for this page summary.
+Do not retrieve new evidence.
+Do not say that supporting sources are missing if the excerpt block below contains page evidence.
+
+Page-local evidence excerpts:
+{rendered_excerpts}
+
+Return valid JSON only with this shape:
+{{
+  "summary": "2-4 clean sentences of page summary text",
+  "key_facts": ["atomic claim 1", "atomic claim 2"]
+}}
+
+Rules:
+- summary and key_facts must be clean prose only
+- do not include citations, markdown, code fences, source filenames, chunk ids, or `(Source: ...)` text anywhere in the JSON values
+- key_facts must be short atomic claims that can be verified independently
+- do not merge this page with any other page
+- do not guess missing details
+- preserve medication, procedure, provider, date, callback, clearance, and provider-action details when present
+- prefer specific clinical or operational details over generic header language
+- if the excerpt block is empty, say that no supporting sources were found for this page
+""".strip()

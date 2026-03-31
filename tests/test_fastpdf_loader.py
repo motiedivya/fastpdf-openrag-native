@@ -124,3 +124,28 @@ def test_load_manifest_round_trips(tmp_path: Path) -> None:
     assert manifest.run_id == "run-2"
     assert manifest.page_documents[0].pdf_id == "alpha.pdf"
     assert manifest.retrieval_document_count == len(manifest.retrieval_documents)
+
+
+def test_materialize_summary_payload_prefers_labeled_service_date_over_dob(tmp_path: Path) -> None:
+    payload = {
+        "pdfs": [
+            {
+                "pdf_id": "alpha.pdf",
+                "pages": [
+                    {
+                        "page": 1,
+                        "ocr_text": "DOB: 11/13/1958 Date of Service: 8/16/2024 Procedure note.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    manifest = materialize_summary_payload(
+        run_id="run-service-date",
+        summary_payload=payload,
+        source_kind="summary_payload",
+        output_dir=tmp_path,
+    )
+
+    assert manifest.page_documents[0].service_date == "8/16/2024"

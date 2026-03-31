@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .layered_output import extract_truth_layer_note, group_truth_layer_notes, render_presentation_layer, validate_truth_layer
-from .models import MaterializationManifest, PageMapSummary, ScopedSummaryResult, SummaryScope, VerifiedSentence
-from .prompts import build_page_map_prompt, build_reduce_prompt
+from .models import EvidenceHit, MaterializationManifest, PageMapSummary, ScopedSummaryResult, SummaryScope, VerifiedSentence
+from .prompts import build_page_local_fallback_prompt, build_page_map_prompt, build_reduce_prompt
 from .reranking import RERANKER_TYPE, attach_rank_metadata, rerank_hits, select_top_source_filenames
 from .settings import AppSettings, get_settings
 
@@ -629,7 +629,7 @@ def _build_page_retrieval_hints(page_retrieval_documents: list[Any], *, max_item
     for index, document in enumerate(page_retrieval_documents):
         title = str(getattr(document, "section_title", "") or "").strip()
         preview = re.sub(r"\s+", " ", str(getattr(document, "text_preview", "") or "")).strip()
-        preview = preview[:160].rstrip() + "…" if len(preview) > 160 else preview
+        preview = preview[:360].rstrip() + "…" if len(preview) > 360 else preview
         label = title or preview or document.source_filename
         rendered = f"- {label} [{document.source_filename}]"
         if preview and preview.lower() != label.lower():
@@ -640,6 +640,70 @@ def _build_page_retrieval_hints(page_retrieval_documents: list[Any], *, max_item
     ranked.sort(key=lambda item: (item[0], -item[1], -item[2]), reverse=True)
     selected_filenames = [filename for _, _, _, filename in ranked[:max_items]]
     return [rendered_by_filename[filename] for filename in selected_filenames]
+
+
+def _build_page_local_evidence_excerpts(
+    page_retrieval_documents: list[Any],
+    *,
+    max_items: int = 4,
+    max_chars: int = 520,
+) -> list[str]:
+    if not page_retrieval_documents:
+        return []
+    ranked: list[tuple[float, int, int, str]] = []
+    rendered_by_filename: dict[str, str] = {}
+    for index, document in enumerate(page_retrieval_documents):
+        excerpt = re.sub(r"\s+", " ", str(getattr(document, "text_preview", "") or "")).strip()
+        if not excerpt:
+            continue
+        if len(excerpt) > max_chars:
+            excerpt = excerpt[:max_chars].rstrip() + "…"
+        section_title = re.sub(r"\s+", " ", str(getattr(document, "section_title", "") or "")).strip()
+        rendered = excerpt if not section_title else f"Section: {section_title}\n{excerpt}"
+        rendered_by_filename[document.source_filename] = rendered
+        score = _document_priority_score(document)
+        ranked.append((score, index, getattr(document, "chunk_index", index), document.source_filename))
+    ranked.sort(key=lambda item: (item[0], -item[1], -item[2]), reverse=True)
+    selected_filenames = [filename for _, _, _, filename in ranked[:max_items]]
+    return [rendered_by_filename[filename] for filename in selected_filenames if filename in rendered_by_filename]
+
+
+def _local_page_evidence_hits(page_retrieval_documents: list[Any], *, max_items: int = 6) -> list[EvidenceHit]:
+    if not page_retrieval_documents:
+        return []
+    ranked_documents = sorted(
+        page_retrieval_documents,
+        key=lambda document: (
+            _document_priority_score(document),
+            -getattr(document, "chunk_index", 0),
+            getattr(document, "source_filename", ""),
+        ),
+        reverse=True,
+    )
+    hits: list[EvidenceHit] = []
+    seen: set[str] = set()
+    for rank, document in enumerate(ranked_documents, start=1):
+        filename = str(getattr(document, "source_filename", "") or "").strip()
+        excerpt = re.sub(r"\s+", " ", str(getattr(document, "text_preview", "") or "")).strip()
+        if not filename or not excerpt or filename in seen:
+            continue
+        seen.add(filename)
+        score = max(0.25, float(_document_priority_score(document)))
+        page_no = getattr(document, "page", None)
+        hits.append(
+            EvidenceHit(
+                filename=filename,
+                text=excerpt,
+                score=score,
+                page=page_no if isinstance(page_no, int) else None,
+                base_score=score,
+                rerank_score=score,
+                retrieval_rank=rank,
+            )
+        )
+        if len(hits) >= max_items:
+            break
+    return hits
 
 
 def _expand_page_selected_sources(
@@ -737,6 +801,9 @@ def _looks_like_retrieval_failure(text: str) -> bool:
             "please provide the url",
             "paste the page content",
             "file upload",
+            "did not return any indexed text",
+            "could not be summarized",
+            "no indexed evidence matching",
         )
     )
 
@@ -932,6 +999,7 @@ async def _summarize_page(
         document for document in filtered_page_documents if document.source_filename in page_sources
     ] or local_page_documents
     retrieval_hints = _build_page_retrieval_hints(active_page_documents)
+    local_evidence_excerpts = _build_page_local_evidence_excerpts(active_page_documents)
     prompt = build_page_map_prompt(
         scope,
         pdf_id=page.pdf_id,
@@ -977,6 +1045,7 @@ async def _summarize_page(
         score_threshold=0,
     )
     retry_used = False
+    local_inventory_fallback_used = False
     if not sources or _looks_like_retrieval_failure(response_text):
         if not reranked_preflight_sources:
             preflight_sources = await gateway.search_on_sources(
@@ -1011,6 +1080,32 @@ async def _summarize_page(
             score_threshold=0,
         )
         retry_used = True
+    if (not sources or _looks_like_retrieval_failure(response_text)) and local_evidence_excerpts:
+        local_prompt = build_page_local_fallback_prompt(
+            scope,
+            pdf_id=page.pdf_id,
+            page=page.page,
+            source_filename=page.source_filename,
+            evidence_excerpts=local_evidence_excerpts,
+        )
+        try:
+            response_text, fallback_sources = await gateway.chat_on_sources(
+                message=local_prompt,
+                data_sources=[],
+                limit=max(_chat_limit(8, settings), 1),
+                score_threshold=0,
+                disable_retrieval=True,
+            )
+        except TypeError:
+            response_text, fallback_sources = await gateway.chat_on_sources(
+                message=local_prompt,
+                data_sources=[],
+                limit=max(_chat_limit(8, settings), 1),
+                score_threshold=0,
+            )
+        if fallback_sources:
+            sources = fallback_sources
+        local_inventory_fallback_used = True
     parsed = _extract_json_object(response_text) or {}
     summary = _sanitize_generated_text(str(parsed.get("summary") or response_text).strip())
     key_facts = parsed.get("key_facts")
@@ -1020,12 +1115,16 @@ async def _summarize_page(
         [_sanitize_generated_text(str(item).strip()) for item in key_facts if str(item).strip()]
     )
 
-    generation_evidence_pool = (
-        list(reranked_preflight_sources)
-        if reranked_preflight_sources
-        else _rank_generation_evidence(query=preflight_query, hits=list(sources), settings=settings)
-    )
-    retrieved_source_strategy = "preflight_pool" if reranked_preflight_sources else "chat_sources"
+    local_evidence_pool = _local_page_evidence_hits(active_page_documents)
+    if reranked_preflight_sources:
+        generation_evidence_pool = list(reranked_preflight_sources)
+        retrieved_source_strategy = "preflight_pool"
+    elif sources:
+        generation_evidence_pool = _rank_generation_evidence(query=preflight_query, hits=list(sources), settings=settings)
+        retrieved_source_strategy = "chat_sources"
+    else:
+        generation_evidence_pool = list(local_evidence_pool)
+        retrieved_source_strategy = "local_page_documents" if local_evidence_pool else "chat_sources"
 
     page_summary = PageMapSummary(
         pdf_id=page.pdf_id,
@@ -1051,6 +1150,8 @@ async def _summarize_page(
         "selected_source_filenames": selected_page_sources or page_sources,
         "expanded_selected_source_filenames": chat_data_sources,
         "source_expansion_debug": source_expansion_debug,
+        "local_evidence_excerpts": local_evidence_excerpts,
+        "local_inventory_fallback_used": local_inventory_fallback_used,
         "clean_summary": summary,
         "clean_key_facts": clean_key_facts,
         "limit": 8,
@@ -1208,7 +1309,7 @@ async def summarize_scope(
     async def verify_page_summary(page, page_summary: PageMapSummary, request_debug: dict[str, Any]):
         candidate_hits = (
             page_summary.retrieved_sources
-            if request_debug.get("retrieved_source_strategy") == "preflight_pool"
+            if request_debug.get("retrieved_source_strategy") in {"preflight_pool", "local_page_documents"}
             else None
         )
         return await _verify_text(
@@ -1223,7 +1324,7 @@ async def summarize_scope(
     async def verify_page_key_facts(page, page_summary: PageMapSummary, request_debug: dict[str, Any]):
         candidate_hits = (
             page_summary.retrieved_sources
-            if request_debug.get("retrieved_source_strategy") == "preflight_pool"
+            if request_debug.get("retrieved_source_strategy") in {"preflight_pool", "local_page_documents"}
             else None
         )
         return await _verify_units(

@@ -127,6 +127,52 @@ class FakeRetryGateway:
         if query == "Supported summary.":
             return [EvidenceHit(filename=data_sources[0], text="verified support", score=0.7)]
         return []
+class LocalInventoryFallbackGateway:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def chat_on_sources(
+        self,
+        *,
+        message: str,
+        data_sources: list[str] | None = None,
+        limit: int = 6,
+        score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
+    ):
+        self.calls.append({
+            "message": message,
+            "data_sources": list(data_sources or []),
+            "disable_retrieval": disable_retrieval,
+        })
+        if "Page-local evidence excerpts:" in message:
+            return (
+                json.dumps(
+                    {
+                        "summary": "Patient reported frequent sharp pain rated 8 out of 10 with increased pain on bending and improvement with injections and therapy.",
+                        "key_facts": [
+                            "Past medical history included hypertension and high cholesterol.",
+                            "Social history included tobacco use and alcohol use.",
+                        ],
+                    }
+                ),
+                [],
+            )
+        return ("No relevant supporting sources were found for this page.", [])
+
+    async def search_on_sources(
+        self,
+        *,
+        query: str,
+        data_sources: list[str],
+        limit: int | None = None,
+        score_threshold: float | None = None,
+    ):
+        return []
+
+
 
 
 class CaptureRerankGateway:
@@ -1572,3 +1618,56 @@ def test_summarize_scope_emits_truth_validation_and_presentation_layers(tmp_path
     assert any(call["llm_model"] == "gpt-5-extractor" for call in gateway.override_calls if "strict supported fact sheet" in str(call["message"]))
     assert any(call["llm_model"] == "gpt-5-renderer" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer renderer" in str(call["message"]))
     assert any(call["llm_model"] == "gpt-5-editor" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer editor" in str(call["message"]))
+
+
+def test_summarize_scope_uses_local_inventory_fallback_when_retrieval_returns_empty(tmp_path: Path) -> None:
+    payload = {
+        "pdfs": [
+            {
+                "pdf_id": "pdf_1",
+                "pages": [
+                    {
+                        "page": 1,
+                        "ocr_text": (
+                            "Date of Service: 8/16/2024 HISTORY OF PRESENTING COMPLAINT: "
+                            "She rates her pain as a 8 out of 10. The patient notes this pain as frequent and sharp in nature. "
+                            "She reports increased pain with bending. She states that her pain is improved with injections and therapy. "
+                            "Past Medical History: Positive and includes hypertension and high cholesterol. "
+                            "Social History: Reports tobacco use. Reports alcohol use."
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    manifest = materialize_summary_payload(
+        run_id="local-inventory-run",
+        summary_payload=payload,
+        source_kind="summary_payload",
+        output_dir=tmp_path,
+        settings=AppSettings(
+            structure_chunk_target_chars=160,
+            structure_chunk_overlap_blocks=0,
+        ),
+    )
+    scope = SummaryScope.model_validate(
+        {
+            "scope_id": "local-inventory-scope",
+            "title": "Local Inventory Scope",
+            "objective": "Summarize the date of service, pain description, history, and social history.",
+            "page_refs": [{"pdf_id": "pdf_1", "page": 1}],
+        }
+    )
+
+    result = asyncio.run(
+        summarize_scope(LocalInventoryFallbackGateway(), manifest=manifest, scope=scope)
+    )
+
+    page_summary = result.page_summaries[0]
+    assert page_summary.summary.startswith("Patient reported frequent sharp pain")
+    assert page_summary.supported_summary
+    assert page_summary.passed_verification is True
+    assert page_summary.retrieved_sources
+    assert result.debug["page_requests"][0]["retrieved_source_strategy"] == "local_page_documents"
+    assert result.debug["page_requests"][0]["local_inventory_fallback_used"] is True
