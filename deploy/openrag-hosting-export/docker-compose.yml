@@ -1,6 +1,6 @@
 services:
   docling:
-    image: ${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:1.15.1}
+    image: ${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:v1.14.3}
     container_name: docling
     restart: unless-stopped
     ports:
@@ -59,10 +59,12 @@ services:
       NO_COLOR: ${NO_COLOR:-}
       FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED: ${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED:-true}
       FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT: ${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT:-24}
+      PYTHONPATH: /app/src
     volumes:
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_chat.py:/app/src/api/v1/chat.py:ro
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_search.py:/app/src/api/v1/search.py:ro
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/session_manager.py:/app/src/session_manager.py:ro
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/sitecustomize.py:/app/src/sitecustomize.py:ro
       - ${OPENRAG_DOCUMENTS_PATH:-./state/openrag-documents}:/app/openrag-documents:U,z
       - ${OPENRAG_KEYS_PATH:-./state/keys}:/app/keys:U,z
       - ${OPENRAG_FLOWS_PATH:-./state/flows}:/app/flows:U,z

@@ -1,10 +1,14 @@
 services:
   openrag-backend:
     environment:
+      - PYTHONPATH=/app/src
       - FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED=${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED:-true}
       - FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT=${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT:-24}
     volumes:
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_chat.py:/app/src/api/v1/chat.py:ro
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_search.py:/app/src/api/v1/search.py:ro
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/session_manager.py:/app/src/session_manager.py:ro
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/sitecustomize.py:/app/src/sitecustomize.py:ro
 
   langflow:
     environment:
