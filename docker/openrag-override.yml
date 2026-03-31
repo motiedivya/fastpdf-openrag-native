@@ -11,6 +11,7 @@ services:
       - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/sitecustomize.py:/app/src/sitecustomize.py:ro
     extra_hosts:
       - host.docker.internal:host-gateway
+      - fastpdf-docling-host:host-gateway
 
   langflow:
     environment:
@@ -19,5 +20,8 @@ services:
       - FASTPDF_OPENRAG_BACKEND_RERANK_MODEL=${FASTPDF_OPENRAG_BACKEND_RERANK_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
       - FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N=${FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N:-8}
       - COHERE_API_KEY=${COHERE_API_KEY:-}
+      - SELECTED_EMBEDDING_MODEL=${SELECTED_EMBEDDING_MODEL:-text-embedding-3-large}
+      - DOCLING_SERVE_URL=${DOCLING_SERVE_URL:-http://fastpdf-docling-host:5001}
     extra_hosts:
       - host.docker.internal:host-gateway
+      - fastpdf-docling-host:host-gateway

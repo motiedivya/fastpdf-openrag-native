@@ -78,8 +78,8 @@ Then edit `.env` and set at minimum:
 - `OPENAI_API_KEY` if you are using OpenAI
 
 Optional Langflow auth:
-- Leave `LANGFLOW_SUPERUSER_PASSWORD` unset if you want Langflow/OpenRAG auto-login mode.
-- Set `LANGFLOW_SUPERUSER_PASSWORD` only if you want password-based Langflow auth; if you do, also set `LANGFLOW_AUTO_LOGIN=false`.
+- Leave `LANGFLOW_SUPERUSER` and `LANGFLOW_SUPERUSER_PASSWORD` unset if you want Langflow/OpenRAG auto-login mode.
+- Set both only if you want password-based Langflow auth; if you do, also set `LANGFLOW_AUTO_LOGIN=false`.
 
 Optional flow overrides:
 - Built-in `LANGFLOW_CHAT_FLOW_ID`, `LANGFLOW_INGEST_FLOW_ID`, and `LANGFLOW_URL_INGEST_FLOW_ID` are auto-detected from the bundled flow JSON or handled by OpenRAG defaults. Set them only if you are overriding the built-in flows.
@@ -143,7 +143,7 @@ The deploy package now includes a Compose-managed `docling` service on port `500
 
 Leave `DOCLING_SERVE_API_KEY` unset unless you intentionally want Docling API-key auth. Current Docling images fail startup if that variable is present but empty.
 
-For Langflow, leave `LANGFLOW_SUPERUSER_PASSWORD` unset if you want default auto-login mode. In that mode, this deploy package now omits the password variable entirely instead of passing an empty string, which matches official OpenRAG/Langflow behavior more closely.
+For Langflow, leave both `LANGFLOW_SUPERUSER` and `LANGFLOW_SUPERUSER_PASSWORD` unset if you want default auto-login mode. In that mode, this deploy package now omits both variables instead of forcing `admin` or passing an empty string, which matches official OpenRAG/Langflow behavior more closely.
 
 The built-in OpenRAG flow IDs can be left unset. `scripts/restart_stack.sh` now auto-detects them from `state/flows/*.json`, and direct `docker compose up` no longer forces them to empty strings.
 

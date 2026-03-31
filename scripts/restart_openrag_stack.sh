@@ -25,6 +25,94 @@ export FASTPDF_OPENRAG_UI_PORT="${FASTPDF_OPENRAG_UI_PORT:-8077}"
 FASTPDF_UI_LOG="${FASTPDF_UI_LOG:-$REPO_ROOT/outputs/serve-ui.log}"
 FASTPDF_UI_PID_FILE="${FASTPDF_UI_PID_FILE:-$REPO_ROOT/outputs/serve-ui.pid}"
 
+OPENRAG_CONFIG_FILE="${OPENRAG_CONFIG_FILE:-$HOME/.openrag/config/config.yaml}"
+
+
+export SELECTED_EMBEDDING_MODEL="${SELECTED_EMBEDDING_MODEL:-text-embedding-3-large}"
+
+sync_openrag_runtime_config() {
+  local config_file="$1"
+  if [[ ! -f "$config_file" ]]; then
+    printf '[warn] OpenRAG config file not found, skipping provider sync: %s\n' "$config_file" >&2
+    return 0
+  fi
+
+  python3 - "$OPENRAG_ENV_FILE" "$config_file" <<'PY_SYNC'
+from pathlib import Path
+import os
+import sys
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text(encoding='utf-8').splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+env_path = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+env_values = parse_env(env_path)
+openai_key = (os.environ.get('OPENAI_API_KEY') or env_values.get('OPENAI_API_KEY') or '').strip()
+embedding_model = (os.environ.get('SELECTED_EMBEDDING_MODEL') or env_values.get('SELECTED_EMBEDDING_MODEL') or 'text-embedding-3-large').strip()
+
+lines = config_path.read_text(encoding='utf-8').splitlines()
+inside_knowledge = False
+inside_openai = False
+knowledge_updated = False
+openai_key_updated = False
+openai_configured_updated = False
+
+for idx, line in enumerate(lines):
+    if line.startswith('knowledge:'):
+        inside_knowledge = True
+        inside_openai = False
+        continue
+    if line.startswith('providers:'):
+        inside_openai = False
+        inside_knowledge = False
+        continue
+    if line.startswith('  openai:'):
+        inside_openai = True
+        inside_knowledge = False
+        continue
+    if line and not line.startswith(' '):
+        inside_knowledge = False
+        inside_openai = False
+        continue
+    if inside_knowledge and line.startswith('  embedding_model:'):
+        lines[idx] = f'  embedding_model: {embedding_model}'
+        knowledge_updated = True
+        continue
+    if inside_openai and line.startswith('    api_key:'):
+        key_value = openai_key if openai_key else "''"
+        lines[idx] = f'    api_key: {key_value}'
+        openai_key_updated = True
+        continue
+    if inside_openai and line.startswith('    configured:'):
+        lines[idx] = f"    configured: {'true' if openai_key else 'false'}"
+        openai_configured_updated = True
+        continue
+    if inside_openai and line.startswith('  ') and not line.startswith('    '):
+        inside_openai = False
+
+config_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+print(
+    f'synced_openrag_runtime_config=true config={config_path} '
+    f'embedding_model={embedding_model} openai_key_present={bool(openai_key)} '
+    f'knowledge_updated={knowledge_updated} openai_key_updated={openai_key_updated} '
+    f'openai_configured_updated={openai_configured_updated}'
+)
+PY_SYNC
+}
+
+
 if [[ ! -f "$OPENRAG_COMPOSE_FILE" ]]; then
   printf '[error] OpenRAG compose file not found: %s\n' "$OPENRAG_COMPOSE_FILE" >&2
   exit 1
@@ -128,6 +216,7 @@ printf '[info] repo=%s\n' "$REPO_ROOT"
 printf '[info] compose=%s\n' "$OPENRAG_COMPOSE_FILE"
 printf '[info] override=%s\n' "$OPENRAG_OVERRIDE_FILE"
 
+sync_openrag_runtime_config "$OPENRAG_CONFIG_FILE"
 restart_docling
 
 compose up -d --no-build --force-recreate opensearch dashboards langflow openrag-backend openrag-frontend
