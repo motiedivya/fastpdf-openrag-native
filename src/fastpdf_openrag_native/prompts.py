@@ -210,6 +210,12 @@ Every rendered item must include one or more fact_ids drawn from the candidate i
 You may reorder and combine candidate facts for readability, but you must not omit clinically or operationally meaningful populated fields.
 Skip empty fields.
 Use narrative prose, one section per note/date when possible.
+Render short declarative sentences with explicit periods.
+Do not chain many facts with semicolons.
+Do not merge unrelated fields into one sentence.
+Prefer one coherent fact cluster per item.
+Preserve exact medical wording for anatomy, imaging, diagnoses, ICD codes, doses, and units when present.
+Omit normal or negative boilerplate unless it is the only supported content for that note/date.
 
 Truth layer JSON:
 {rendered_truth}
@@ -258,6 +264,10 @@ Omit normal or negative findings unless they are the only supported content for 
 Render one polished paragraph per note/date with stable chronological ordering when possible.
 Every rendered item must include one or more fact_ids already present in the draft.
 You may merge or split draft sentences for readability, but you must preserve all supported required details.
+Keep one coherent fact cluster per sentence.
+Do not merge exam findings with ROS boilerplate, diagnosis with plan, or history with unrelated imaging details.
+Prefer exact medical wording for anatomy, imaging, diagnoses, ICD codes, doses, and units.
+Reject vague endings and incomplete anatomical phrases.
 Return valid JSON only.
 
 Truth layer JSON:

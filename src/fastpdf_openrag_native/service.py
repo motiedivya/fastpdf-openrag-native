@@ -668,6 +668,148 @@ def _merge_sections_for_display(sections: list[dict[str, Any]]) -> list[dict[str
     return [*detailed_sections, *other_sections]
 
 
+def _normalize_display_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _build_presentation_sections_for_display(
+    *,
+    summary: ScopedSummaryResult,
+    citation_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    presentation = summary.presentation_layer
+    if presentation is None or not presentation.sections:
+        return []
+
+    sections: list[dict[str, Any]] = []
+    title_counts: dict[str, int] = {}
+    for rendered_section in presentation.sections:
+        base_title = _normalize_display_text(rendered_section.title) or "Section"
+        title_counts[base_title] = title_counts.get(base_title, 0) + 1
+
+    title_offsets: dict[str, int] = {}
+
+    def _row_filename_keys(row: dict[str, Any]) -> set[str]:
+        return {
+            str(row.get("chunk_id") or "").strip().lower(),
+            str(row.get("source_filename") or "").strip().lower(),
+            str(row.get("page_source_filename") or "").strip().lower(),
+        } - {""}
+
+    for section_index, rendered_section in enumerate(presentation.sections, start=1):
+        item_rows: list[dict[str, Any]] = []
+        for item_index, rendered_item in enumerate(rendered_section.items, start=1):
+            rendered_text = _normalize_display_text(rendered_item.text)
+            if not rendered_text:
+                continue
+
+            candidate_filenames = list(
+                dict.fromkeys(
+                    [str(hit.filename).strip() for hit in rendered_item.evidence if str(hit.filename or "").strip()]
+                    + [str(filename).strip() for filename in (rendered_item.candidate_filenames or []) if str(filename or "").strip()]
+                )
+            )
+            filename_keys = {filename.lower() for filename in candidate_filenames}
+            page_keys = {
+                (str(pdf_id).strip(), int(page))
+                for pdf_id in (rendered_item.pdf_ids or [])
+                for page in (rendered_item.pages or [])
+                if str(pdf_id).strip() and isinstance(page, int)
+            }
+            normalized_text = rendered_text.lower()
+
+            def _row_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
+                sentence_text = _normalize_display_text(row.get("sentence_text") or row.get("snippet") or "")
+                position = normalized_text.find(sentence_text.lower()) if sentence_text else -1
+                if position < 0:
+                    position = 10**9
+                return (position, int(row.get("page") or 0), int(row.get("number") or 10**9))
+
+            matched_rows: list[dict[str, Any]] = []
+            for row in citation_rows:
+                row_id = str(row.get("id") or "").strip()
+                if not row_id:
+                    continue
+                row_sentence = _normalize_display_text(row.get("sentence_text") or row.get("snippet") or "")
+                row_text_match = bool(row_sentence and row_sentence.lower() in normalized_text)
+                row_filename_match = bool(filename_keys and (_row_filename_keys(row) & filename_keys))
+                row_page_match = (
+                    not page_keys
+                    or (str(row.get("pdf_id") or "").strip(), int(row.get("page") or 0)) in page_keys
+                )
+                if row_text_match and (row_filename_match or row_page_match):
+                    matched_rows.append(row)
+
+            if not matched_rows and filename_keys:
+                matched_rows = [row for row in citation_rows if _row_filename_keys(row) & filename_keys]
+            if not matched_rows and page_keys:
+                matched_rows = [
+                    row
+                    for row in citation_rows
+                    if (str(row.get("pdf_id") or "").strip(), int(row.get("page") or 0)) in page_keys
+                ]
+
+            matched_rows.sort(key=_row_sort_key)
+
+            seen_row_ids: set[str] = set()
+            sentence_rows: list[dict[str, Any]] = []
+            for row in matched_rows:
+                row_id = str(row.get("id") or "").strip()
+                sentence_text = _normalize_display_text(row.get("sentence_text") or row.get("snippet") or "")
+                if not row_id or not sentence_text or row_id in seen_row_ids:
+                    continue
+                seen_row_ids.add(row_id)
+                sentence_rows.append(row)
+
+            if sentence_rows:
+                for sentence_index, row in enumerate(sentence_rows, start=1):
+                    sentence_text = _normalize_display_text(row.get("sentence_text") or row.get("snippet") or "")
+                    item_rows.append(
+                        {
+                            "item_id": str(row.get("sentence_id") or f"{rendered_section.section_id or 'section'}-{item_index:03d}-{sentence_index:02d}"),
+                            "text": sentence_text,
+                            "citation_ids": [str(row.get("id") or "").strip()],
+                            "supported": True,
+                            "degraded": bool(row.get("degraded")),
+                            "degraded_reason": str(row.get("degraded_reason") or "").strip() or None,
+                            "pdf_id": str(row.get("pdf_id") or "").strip() or None,
+                            "page": int(row.get("page") or 0) or None,
+                        }
+                    )
+                continue
+
+            item_rows.append(
+                {
+                    "item_id": rendered_item.item_id or f"{rendered_section.section_id or 'section'}-{item_index:03d}",
+                    "text": rendered_text,
+                    "citation_ids": [],
+                    "supported": True,
+                    "degraded": False,
+                    "degraded_reason": None,
+                    "pdf_id": str(rendered_item.pdf_ids[0]).strip() if rendered_item.pdf_ids else None,
+                    "page": int(rendered_item.pages[0]) if rendered_item.pages else None,
+                }
+            )
+
+        if item_rows:
+            base_title = _normalize_display_text(rendered_section.title) or f"Section {section_index}"
+            title_offsets[base_title] = title_offsets.get(base_title, 0) + 1
+            display_title = base_title
+            if title_counts.get(base_title, 0) > 1:
+                display_title = f"{base_title} · Note {title_offsets[base_title]}"
+            sections.append(
+                {
+                    "section_id": rendered_section.section_id or f"rendered-section-{section_index:03d}",
+                    "title": display_title,
+                    "kind": "supported_summary",
+                    "debug_only": False,
+                    "items": item_rows,
+                }
+            )
+
+    return sections
+
+
 def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     recovered_payload = _recover_job_artifacts(payload)
     payload.update(recovered_payload)
@@ -716,7 +858,9 @@ def _build_summary_view_model(job_id: str, payload: dict[str, Any]) -> dict[str,
         citation_instances.append(row)
 
     resolved = summary.resolved_citations.model_dump(mode="json") if summary.resolved_citations else {"sections": [], "source_pages": []}
-    merged_sections = _merge_sections_for_display(list(resolved.get("sections", [])))
+    merged_sections = _build_presentation_sections_for_display(summary=summary, citation_rows=citation_instances)
+    if not merged_sections:
+        merged_sections = _merge_sections_for_display(list(resolved.get("sections", [])))
     visible_citation_ids: list[str] = []
     seen_visible_ids: set[str] = set()
     for section in merged_sections:
@@ -1201,6 +1345,14 @@ def _render_summary_page(job_id: str) -> str:
       gap: 14px;
       padding: 12px;
     }
+    .pdf-fallback-frame {
+      width: 100%;
+      min-height: 72vh;
+      border: 0;
+      border-radius: 18px;
+      background: #fff;
+    }
+
     .pdf-placeholder {
       min-height: 420px;
       width: 100%;
@@ -1533,6 +1685,17 @@ def _render_summary_page(job_id: str) -> str:
       const sourcePages = Array.isArray(state.model?.source_pages) ? state.model.source_pages : [];
       const activePage = pageForCitation(citation);
       const sourcePdfUrl = citation?.source_pdf_url || activePage?.source_pdf_url || state.model?.urls?.source_pdf || null;
+      const fallbackPageNumber = citation?.page || activePage?.page || 1;
+
+      function renderPdfFallback() {
+        if (!sourcePdfUrl) return false;
+        const frame = document.createElement('iframe');
+        frame.className = 'pdf-fallback-frame';
+        frame.src = `${sourcePdfUrl}#page=${fallbackPageNumber}`;
+        frame.title = `Source PDF page ${fallbackPageNumber}`;
+        el.viewerScroll.appendChild(frame);
+        return true;
+      }
 
       el.viewerScroll.innerHTML = "";
       el.sourcePdfLink.hidden = !sourcePdfUrl;
@@ -1548,6 +1711,7 @@ def _render_summary_page(job_id: str) -> str:
       }
 
       if (!sourcePages.length) {
+        if (renderPdfFallback()) return;
         const placeholder = document.createElement("div");
         placeholder.className = "pdf-placeholder";
         placeholder.textContent = "No rendered source page is available for this summary item.";
@@ -1633,7 +1797,7 @@ def _render_summary_page(job_id: str) -> str:
         caption.className = "pdf-page-meta";
         if (!citation) {
           caption.textContent = `Available source page ${page.page} for ${page.pdf_id}.`;
-        } else if (isTargetPage && citation.degraded) {
+        } else if (isTargetPage && citation.degraded && state.debugMode) {
           caption.textContent = `Degraded citation mapping on ${page.pdf_id} page ${page.page}. The page is correct, but the highlight falls back to page-level evidence.`;
         } else if (isTargetPage) {
           caption.textContent = `Matched OCR paragraphs on ${page.pdf_id} page ${page.page}. Click a highlighted region to return to the linked summary sentence.`;
@@ -1650,6 +1814,7 @@ def _render_summary_page(job_id: str) -> str:
       });
 
       if (!fragment.childElementCount) {
+        if (renderPdfFallback()) return;
         const placeholder = document.createElement("div");
         placeholder.className = "pdf-placeholder";
         placeholder.textContent = "No rendered source page is available for this summary item.";
@@ -1672,7 +1837,7 @@ def _render_summary_page(job_id: str) -> str:
         return;
       }
       el.activeTitle.textContent = `${citation.pdf_id} · Page ${citation.page}`;
-      el.activeMeta.textContent = citation.degraded
+      el.activeMeta.textContent = state.debugMode && citation.degraded
         ? `${citation.snippet || citation.label} • degraded mapping fallback on page ${citation.page}`
         : `${citation.snippet || citation.label}`;
       el.debugBlock.hidden = !state.debugMode;
@@ -1697,7 +1862,7 @@ def _render_summary_page(job_id: str) -> str:
     function renderSections() {
       const sections = Array.isArray(state.model?.sections) ? state.model.sections : [];
       el.summaryScroll.innerHTML = "";
-      let visibleSentenceCount = 0;
+      let visibleItemCount = 0;
       sections.forEach((section) => {
         if (section.debug_only && !state.debugMode) return;
         const wrap = document.createElement("section");
@@ -1710,7 +1875,7 @@ def _render_summary_page(job_id: str) -> str:
         const list = document.createElement("div");
         list.className = "sentence-list";
         (section.items || []).forEach((item) => {
-          visibleSentenceCount += 1;
+          visibleItemCount += 1;
           const sentence = document.createElement("button");
           sentence.type = "button";
           sentence.className = "sentence-card";
@@ -1740,19 +1905,36 @@ def _render_summary_page(job_id: str) -> str:
             marker.dataset.active = String(number === (citationForId(state.activeCitationId)?.number || null));
             marker.textContent = String(number);
             marker.title = citationRow?.label || `Citation ${number}`;
+            if (citationRow?.id) {
+              marker.tabIndex = 0;
+              marker.setAttribute("role", "button");
+              marker.setAttribute("aria-label", `Open citation ${number}`);
+              const openMarkerCitation = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                state.activeItemId = item.item_id;
+                activateCitation(citationRow.id, item.item_id);
+              };
+              marker.addEventListener("click", openMarkerCitation);
+              marker.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  openMarkerCitation(event);
+                }
+              });
+            }
             text.appendChild(marker);
           });
           sentence.appendChild(text);
 
           const meta = document.createElement("div");
           meta.className = "sentence-meta";
-          if (item.degraded) {
+          if (state.debugMode && item.degraded) {
             const degraded = document.createElement("span");
             degraded.className = "badge warn";
             degraded.textContent = "Degraded";
             meta.appendChild(degraded);
           }
-          if (item.supported === false) {
+          if (state.debugMode && item.supported === false) {
             const unsupported = document.createElement("span");
             unsupported.className = "badge err";
             unsupported.textContent = "Unsupported";
@@ -1769,7 +1951,7 @@ def _render_summary_page(job_id: str) -> str:
       if (!el.summaryScroll.childElementCount) {
         el.summaryScroll.innerHTML = '<div class="muted">No summary sections are available yet.</div>';
       }
-      el.summaryCount.textContent = `${visibleSentenceCount} cited sentence${visibleSentenceCount === 1 ? "" : "s"}`;
+      el.summaryCount.textContent = `${visibleItemCount} cited item${visibleItemCount === 1 ? "" : "s"}`;
     }
 
     async function loadModel() {

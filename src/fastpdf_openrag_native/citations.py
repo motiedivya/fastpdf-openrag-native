@@ -8,6 +8,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    import fitz  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional runtime dependency
+    fitz = None
+
 from .models import (
     CitationBox,
     CitationIndexEntry,
@@ -48,6 +53,25 @@ STOPWORDS = {
 SOURCE_TAIL_RE = re.compile(r"\s*\((?:Source|Sources)\s*:[^)]+\)\s*$", flags=re.IGNORECASE)
 PAGE_AS_ABOVE_RE = re.compile(r"\s*\(Sources?\s+as\s+above\)\s*$", flags=re.IGNORECASE)
 PAGE_PREFIX_RE = re.compile(r"^Page\s+(\d+)\s*(?:\([^)]*\))?\s*:\s*", flags=re.IGNORECASE)
+PROTECTED_ABBREVIATION_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"\bM\.D\.",
+        r"\bD\.O\.",
+        r"\bPh\.D\.",
+        r"\bDr\.",
+        r"\bMr\.",
+        r"\bMrs\.",
+        r"\bMs\.",
+        r"\bProf\.",
+        r"\bNo\.(?=\s*\d)",
+        r"\bSt\.",
+        r"\bvs\.",
+        r"\betc\.",
+    )
+)
+INITIAL_PATTERN = re.compile(r"\b[A-Z]\.(?=\s+[A-Z][a-z])")
+INITIAL_SERIES_PATTERN = re.compile(r"\b(?:[A-Z]\.){2,}")
 
 
 @dataclass(slots=True)
@@ -192,11 +216,44 @@ def _score_text_similarity(left: str, right: str) -> float:
     return (forward * 0.7) + (reverse * 0.3)
 
 
+def _protect_sentence_tokens(text: str) -> tuple[str, dict[str, str]]:
+    protected = text
+    replacements: dict[str, str] = {}
+    counter = 0
+
+    def reserve(raw: str) -> str:
+        nonlocal counter
+        token = f"__FASTPDF_CIT_SENT_{counter}__"
+        counter += 1
+        replacements[token] = raw
+        return token
+
+    for pattern in PROTECTED_ABBREVIATION_PATTERNS:
+        protected = pattern.sub(lambda match: reserve(match.group(0)), protected)
+    protected = INITIAL_SERIES_PATTERN.sub(lambda match: reserve(match.group(0)), protected)
+    protected = INITIAL_PATTERN.sub(lambda match: reserve(match.group(0)), protected)
+    return protected, replacements
+
+
+def _restore_sentence_tokens(text: str, replacements: dict[str, str]) -> str:
+    restored = text
+    for token, raw in replacements.items():
+        restored = restored.replace(token, raw)
+    return restored
+
+
 def _split_sentences(text: str) -> list[str]:
     clean = _normalize_space(text)
     if not clean:
         return []
-    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+    protected, replacements = _protect_sentence_tokens(clean)
+    parts = re.split(r"(?<=[.!?])\s+", protected)
+    sentences: list[str] = []
+    for part in parts:
+        restored = _normalize_space(_restore_sentence_tokens(part, replacements))
+        if restored:
+            sentences.append(restored)
+    return sentences
 
 
 def _split_grounding_units(text: str) -> list[str]:
@@ -259,6 +316,37 @@ def _copy_source_pdf(source_pdf: Path | None, extraction_dir: Path) -> Path | No
     return destination
 
 
+def _render_page_image_from_pdf(
+    *,
+    extraction_dir: Path,
+    source_pdf_path: Path | None,
+    pdf_id: str,
+    page: int,
+) -> tuple[str | None, int | None, int | None]:
+    if source_pdf_path is None or not source_pdf_path.exists() or fitz is None:
+        return None, None, None
+    artifacts_dir = extraction_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    image_path = artifacts_dir / f"{pdf_id}__p{page:04d}.png"
+    document = None
+    try:
+        document = fitz.open(source_pdf_path)
+        page_index = max(0, page - 1)
+        if page_index >= len(document):
+            return None, None, None
+        pdf_page = document.load_page(page_index)
+        matrix = fitz.Matrix(1.6, 1.6)
+        pix = pdf_page.get_pixmap(matrix=matrix, alpha=False)
+        if not image_path.exists():
+            pix.save(image_path.as_posix())
+        return image_path.as_posix(), int(pix.width), int(pix.height)
+    except Exception:
+        return None, None, None
+    finally:
+        if document is not None:
+            document.close()
+
+
 def _build_page_assets(
     manifest: MaterializationManifest,
     *,
@@ -272,8 +360,19 @@ def _build_page_assets(
     for page in manifest.page_documents:
         html_path = (extraction_dir / page.relative_path).resolve()
         image_path = None
+        rendered_width = _safe_int(page.metadata.get("page_width")) or None
+        rendered_height = _safe_int(page.metadata.get("page_height")) or None
         if page.artifacts.get("page_image"):
             image_path = (extraction_dir / page.artifacts["page_image"]).resolve().as_posix()
+        if image_path is None and source_pdf_copy_path is not None:
+            image_path, fallback_width, fallback_height = _render_page_image_from_pdf(
+                extraction_dir=extraction_dir,
+                source_pdf_path=source_pdf_copy_path,
+                pdf_id=page.pdf_id,
+                page=page.page,
+            )
+            rendered_width = rendered_width or fallback_width
+            rendered_height = rendered_height or fallback_height
         paragraphs = _load_html_paragraphs(html_path) if html_path.exists() else []
         by_block_paragraph = {
             (paragraph["block_index"], paragraph["paragraph_index"]): paragraph
@@ -293,8 +392,8 @@ def _build_page_assets(
             image_path=image_path,
             html_path=html_path.as_posix(),
             source_pdf_path=source_pdf_copy_path.as_posix() if source_pdf_copy_path else None,
-            width=int(page.metadata.get("page_width") or 0) or None,
-            height=int(page.metadata.get("page_height") or 0) or None,
+            width=rendered_width,
+            height=rendered_height,
             paragraph_count=int(page.metadata.get("paragraph_count") or 0) or len(paragraphs) or None,
             paragraphs=paragraphs,
             by_block_paragraph=by_block_paragraph,
@@ -507,7 +606,7 @@ def _build_sections(
             )
             if items:
                 sections.append((section, items))
-        elif page_summary.supported_summary or page_summary.summary:
+        elif page_summary.supported_summary or (page_summary.summary and page_summary.passed_verification):
             section = CitationSection(
                 section_id=f"page-{page_summary.page}-summary",
                 title=page_title,
@@ -527,7 +626,7 @@ def _build_sections(
             if items:
                 sections.append((section, items))
 
-        visible_key_facts = page_summary.supported_key_facts or page_summary.key_facts
+        visible_key_facts = list(page_summary.supported_key_facts or [])
         if visible_key_facts:
             section = CitationSection(
                 section_id=f"page-{page_summary.page}-key-facts",

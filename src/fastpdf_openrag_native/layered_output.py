@@ -64,7 +64,7 @@ PROVIDER_SIGNAL_RE = re.compile(r"\b(?:m\.d\.|d\.o\.|np\b|pa\b|cfnp|physician|pr
 NOTE_TYPE_SIGNAL_RE = re.compile(r"\b(?:visit note|progress note|operative note|phone ?msg|final report|procedure note|history and physical)\b", flags=re.IGNORECASE)
 PATIENT_SIGNAL_RE = re.compile(r"\b(?:mr\.|mrs\.|ms\.|patient|dob)\b", flags=re.IGNORECASE)
 NORMAL_FINDING_SIGNAL_RE = re.compile(
-    r"\b(?:well[- ]appearing|not in acute distress|normal|regular rate and rhythm|s1 and s2|no murmurs|no rubs|no gallops|well perfused|radial pulses(?:\s*2\+)?|no cervical adenopathy|normal mood and affect|appropriate judgment and insight|grossly intact memory|alert and oriented(?: status)?|cranial nerves grossly intact|normal gait|equal movement of all extremities|normal ear|normal oropharyngeal|oropharyngeal findings)\b",
+    r"\b(?:well[- ]appearing|not in acute distress|normal|regular rate and rhythm|s1 and s2|no murmurs|no rubs|no gallops|well perfused|radial pulses(?:\s*2\+)?|reflexes?\s*2\+\s+bilaterally|sensation\s+intact(?:\s+to\s+light\s+touch)?|intact(?:\s+to\s+light\s+touch)?|review of systems (?:was )?otherwise negative(?: except as noted)?|otherwise negative(?: except as noted)?|no cervical adenopathy|normal mood and affect|appropriate judgment and insight|grossly intact memory|alert and oriented(?: status)?|cranial nerves grossly intact|normal gait|equal movement of all extremities|normal ear|normal oropharyngeal|oropharyngeal findings)\b",
     flags=re.IGNORECASE,
 )
 NEGATIVE_FINDING_SIGNAL_RE = re.compile(
