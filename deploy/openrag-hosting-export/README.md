@@ -1,0 +1,145 @@
+# OpenRAG Hosting Export
+
+This directory is a standalone deployment/export package for the OpenRAG stack currently used by `fastpdf-openrag-native`.
+
+It exists so you can:
+- deploy the same OpenRAG stack without depending on `~/.openrag/tui`
+- keep the native repo hotfixes and rerank wiring
+- export your current local OpenRAG config without editing it
+
+This package does not modify your live config. It only gives you:
+- a portable `docker-compose.yml`
+- a sanitized `.env.example`
+- helper scripts for export, restart, and health checks
+
+## What this package deploys
+
+The compose file here includes the same major pieces used by the native repo:
+- `openrag-backend`
+- `openrag-frontend`
+- `langflow`
+- `opensearch`
+- `opensearch-dashboards`
+- the native repo backend hotfix mounts:
+  - `openrag-hotfixes/api_v1_chat.py`
+  - `openrag-hotfixes/api_v1_search.py`
+  - `openrag-hotfixes/session_manager.py`
+- backend/langflow rerank environment wiring
+
+Docling is still treated the same way your current setup treats it: as a host process started separately by `scripts/restart_stack.sh` unless you disable that behavior.
+
+## Is the fastpdf bridge code needed here?
+
+No, not for hosting this stack.
+
+The bridge code in `fastpdf/openrag_native_bridge` is only needed when the legacy `fastpdf` batch monitor / batch system wants to delegate jobs into `fastpdf-openrag-native`.
+
+If you are deploying and using `fastpdf-openrag-native` directly, the native repo already does its own:
+- OCR/materialization
+- OpenRAG ingestion
+- retrieval/rerank
+- verification
+- citation rendering
+- UI/API/CLI orchestration
+
+So for standalone hosting of the native system, do not bring the bridge.
+
+Use the bridge only if you want old `fastpdf` services to call into the native stack.
+
+## Files in this directory
+
+- `docker-compose.yml`
+  Current portable compose for the OpenRAG services used by the native repo.
+- `.env.example`
+  Sanitized environment template with placeholders.
+- `scripts/restart_stack.sh`
+  Restarts Docling plus the OpenRAG services, then reapplies native flow upgrades/settings.
+- `scripts/healthcheck.sh`
+  Quick health check for the deployed services.
+- `scripts/export_local_openrag_config.sh`
+  Copies your current local `~/.openrag` state into an ignored `exports/` directory without editing the live setup.
+
+## Quick start
+
+### 1. Create a local env file
+
+```bash
+cd /home/divyesh-nandlal-vishwakarma/Desktop/Divyesh/fastpdf-openrag-native/deploy/openrag-hosting-export
+cp .env.example .env
+```
+
+Then edit `.env` and set at minimum:
+- `FASTPDF_OPENRAG_NATIVE_ROOT`
+- `OPENSEARCH_PASSWORD`
+- `LANGFLOW_SECRET_KEY`
+- `LANGFLOW_SUPERUSER_PASSWORD`
+- `SESSION_SECRET`
+- `LANGFLOW_CHAT_FLOW_ID`
+- `LANGFLOW_INGEST_FLOW_ID`
+- `LANGFLOW_URL_INGEST_FLOW_ID`
+- `OPENAI_API_KEY` if you are using OpenAI
+
+### 2. Export your current local config if you want exact parity
+
+This copies your current `~/.openrag/tui/.env`, compose, flows, config, documents, and data into `exports/`.
+It does not edit the live setup.
+
+```bash
+cd /home/divyesh-nandlal-vishwakarma/Desktop/Divyesh/fastpdf-openrag-native/deploy/openrag-hosting-export
+bash ./scripts/export_local_openrag_config.sh
+```
+
+If you also want to export the current key material, do this carefully:
+
+```bash
+cd /home/divyesh-nandlal-vishwakarma/Desktop/Divyesh/fastpdf-openrag-native/deploy/openrag-hosting-export
+INCLUDE_KEYS=true bash ./scripts/export_local_openrag_config.sh
+```
+
+### 3. Start or restart the stack
+
+```bash
+cd /home/divyesh-nandlal-vishwakarma/Desktop/Divyesh/fastpdf-openrag-native/deploy/openrag-hosting-export
+bash ./scripts/restart_stack.sh
+```
+
+That script will:
+- optionally restart the host Docling process
+- start the compose services
+- run `fastpdf-openrag-native upgrade-openrag-flows`
+- apply the recommended knowledge settings
+- run `diagnose-stack`
+
+### 4. Check health
+
+```bash
+cd /home/divyesh-nandlal-vishwakarma/Desktop/Divyesh/fastpdf-openrag-native/deploy/openrag-hosting-export
+bash ./scripts/healthcheck.sh
+```
+
+## Service URLs
+
+With the default ports:
+- OpenRAG frontend: `http://127.0.0.1:3000/`
+- Langflow: `http://127.0.0.1:7860/`
+- OpenSearch Dashboards: `http://127.0.0.1:5601/`
+- OpenSearch HTTPS API: `https://127.0.0.1:9200/`
+
+## Notes about flows and IDs
+
+This deployment package does not embed your live Langflow flow IDs or private env values.
+Those come from your actual deployment state.
+
+If you want exact parity with the stack you are already running, use `scripts/export_local_openrag_config.sh` first and copy the needed values from that export into `.env`.
+
+## Notes about Docling
+
+The current native setup expects Docling at `http://host.docker.internal:5001` from inside containers.
+
+`scripts/restart_stack.sh` keeps that behavior and starts a host Docling process by default. If you already manage Docling elsewhere, set:
+
+```bash
+DOCLING_MANAGED=false bash ./scripts/restart_stack.sh
+```
+
+and point `DOCLING_SERVE_URL` at your external Docling endpoint in `.env`.

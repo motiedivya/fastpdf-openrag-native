@@ -1,0 +1,161 @@
+services:
+  openrag-backend:
+    image: langflowai/openrag-backend:${OPENRAG_VERSION:-latest}
+    container_name: openrag-backend
+    restart: unless-stopped
+    depends_on:
+      - langflow
+    environment:
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
+      OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
+      OPENSEARCH_INDEX_NAME: ${OPENSEARCH_INDEX_NAME:-documents}
+      LANGFLOW_URL: http://langflow:7860
+      LANGFLOW_PUBLIC_URL: ${LANGFLOW_PUBLIC_URL:-http://127.0.0.1:7860}
+      LANGFLOW_AUTO_LOGIN: ${LANGFLOW_AUTO_LOGIN:-true}
+      LANGFLOW_SUPERUSER: ${LANGFLOW_SUPERUSER:-admin}
+      LANGFLOW_SUPERUSER_PASSWORD: ${LANGFLOW_SUPERUSER_PASSWORD}
+      LANGFLOW_CHAT_FLOW_ID: ${LANGFLOW_CHAT_FLOW_ID}
+      LANGFLOW_INGEST_FLOW_ID: ${LANGFLOW_INGEST_FLOW_ID}
+      LANGFLOW_URL_INGEST_FLOW_ID: ${LANGFLOW_URL_INGEST_FLOW_ID}
+      DISABLE_INGEST_WITH_LANGFLOW: ${DISABLE_INGEST_WITH_LANGFLOW:-false}
+      INGEST_SAMPLE_DATA: ${INGEST_SAMPLE_DATA:-false}
+      NUDGES_FLOW_ID: ${NUDGES_FLOW_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      WATSONX_API_KEY: ${WATSONX_API_KEY:-}
+      WATSONX_ENDPOINT: ${WATSONX_ENDPOINT:-}
+      WATSONX_PROJECT_ID: ${WATSONX_PROJECT_ID:-}
+      OLLAMA_ENDPOINT: ${OLLAMA_ENDPOINT:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      LANGFLOW_KEY: ${LANGFLOW_KEY:-}
+      LANGFLOW_KEY_RETRIES: ${LANGFLOW_KEY_RETRIES:-15}
+      LANGFLOW_KEY_RETRY_DELAY: ${LANGFLOW_KEY_RETRY_DELAY:-2.0}
+      LANGFLOW_TIMEOUT: ${LANGFLOW_TIMEOUT:-2400}
+      LANGFLOW_CONNECT_TIMEOUT: ${LANGFLOW_CONNECT_TIMEOUT:-30}
+      INGESTION_TIMEOUT: ${INGESTION_TIMEOUT:-3600}
+      UPLOAD_BATCH_SIZE: ${UPLOAD_BATCH_SIZE:-25}
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      DOCLING_OCR_ENGINE: ${DOCLING_OCR_ENGINE:-rapidocr}
+      SESSION_SECRET: ${SESSION_SECRET}
+      SERVICE_NAME: ${SERVICE_NAME:-fastpdf-openrag-native}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-plain}
+      ACCESS_LOG: ${ACCESS_LOG:-true}
+      NO_COLOR: ${NO_COLOR:-}
+      FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED: ${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_ENABLED:-true}
+      FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT: ${FASTPDF_OPENRAG_BACKEND_SEARCH_RERANK_CANDIDATE_LIMIT:-24}
+    volumes:
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_chat.py:/app/src/api/v1/chat.py:ro
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/api_v1_search.py:/app/src/api/v1/search.py:ro
+      - ${FASTPDF_OPENRAG_NATIVE_ROOT}/openrag-hotfixes/session_manager.py:/app/src/session_manager.py:ro
+      - ${OPENRAG_DOCUMENTS_PATH:-./state/openrag-documents}:/app/openrag-documents:U,z
+      - ${OPENRAG_KEYS_PATH:-./state/keys}:/app/keys:U,z
+      - ${OPENRAG_FLOWS_PATH:-./state/flows}:/app/flows:U,z
+      - ${OPENRAG_CONFIG_PATH:-./state/config}:/app/config:U,z
+      - ${OPENRAG_DATA_PATH:-./state/data}:/app/data:U,z
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  openrag-frontend:
+    image: langflowai/openrag-frontend:${OPENRAG_VERSION:-latest}
+    container_name: openrag-frontend
+    restart: unless-stopped
+    depends_on:
+      - openrag-backend
+    environment:
+      OPENRAG_BACKEND_HOST: openrag-backend
+    ports:
+      - ${FRONTEND_PORT:-3000}:3000
+
+  langflow:
+    image: langflowai/openrag-langflow:${OPENRAG_VERSION:-latest}
+    container_name: langflow
+    restart: unless-stopped
+    ports:
+      - ${LANGFLOW_PORT:-7860}:7860
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      WATSONX_APIKEY: ${WATSONX_API_KEY:-}
+      WATSONX_URL: ${WATSONX_ENDPOINT:-}
+      WATSONX_PROJECT_ID: ${WATSONX_PROJECT_ID:-}
+      OLLAMA_BASE_URL: ${OLLAMA_ENDPOINT:-}
+      LANGFLOW_LOAD_FLOWS_PATH: /app/flows
+      LANGFLOW_SECRET_KEY: ${LANGFLOW_SECRET_KEY}
+      JWT: None
+      OWNER: None
+      OWNER_NAME: None
+      OWNER_EMAIL: None
+      CONNECTOR_TYPE: system
+      CONNECTOR_TYPE_URL: url
+      DOCUMENT_ID: None
+      SOURCE_URL: None
+      ALLOWED_USERS: '[]'
+      ALLOWED_GROUPS: '[]'
+      OPENRAG-QUERY-FILTER: '{}'
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
+      OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_URL: https://${OPENSEARCH_HOST:-opensearch}:${OPENSEARCH_PORT:-9200}
+      OPENSEARCH_INDEX_NAME: ${OPENSEARCH_INDEX_NAME:-documents}
+      DOCLING_SERVE_URL: ${DOCLING_SERVE_URL:-http://host.docker.internal:5001}
+      FILENAME: None
+      MIMETYPE: None
+      FILESIZE: '0'
+      SELECTED_EMBEDDING_MODEL: ${SELECTED_EMBEDDING_MODEL:-text-embedding-3-large}
+      LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT: JWT,OPENRAG-QUERY-FILTER,OPENSEARCH_PASSWORD,OPENSEARCH_URL,DOCLING_SERVE_URL,OWNER,OWNER_NAME,OWNER_EMAIL,CONNECTOR_TYPE,DOCUMENT_ID,SOURCE_URL,ALLOWED_USERS,ALLOWED_GROUPS,FILENAME,MIMETYPE,FILESIZE,SELECTED_EMBEDDING_MODEL,OPENAI_API_KEY,OPENAI_BASE_URL,ANTHROPIC_API_KEY,WATSONX_APIKEY,WATSONX_URL,WATSONX_PROJECT_ID,OLLAMA_BASE_URL,OPENSEARCH_INDEX_NAME,COHERE_API_KEY
+      LANGFLOW_LOG_LEVEL: DEBUG
+      LANGFLOW_WORKERS: ${LANGFLOW_WORKERS:-1}
+      LANGFLOW_AUTO_LOGIN: ${LANGFLOW_AUTO_LOGIN:-true}
+      LANGFLOW_SUPERUSER: ${LANGFLOW_SUPERUSER:-admin}
+      LANGFLOW_SUPERUSER_PASSWORD: ${LANGFLOW_SUPERUSER_PASSWORD}
+      LANGFLOW_NEW_USER_IS_ACTIVE: ${LANGFLOW_NEW_USER_IS_ACTIVE:-true}
+      LANGFLOW_ENABLE_SUPERUSER_CLI: ${LANGFLOW_ENABLE_SUPERUSER_CLI:-true}
+      HIDE_GETTING_STARTED_PROGRESS: 'true'
+      FASTPDF_OPENRAG_BACKEND_RERANK_ENABLED: ${FASTPDF_OPENRAG_BACKEND_RERANK_ENABLED:-true}
+      FASTPDF_OPENRAG_BACKEND_RERANK_PROVIDER: ${FASTPDF_OPENRAG_BACKEND_RERANK_PROVIDER:-cross_encoder}
+      FASTPDF_OPENRAG_BACKEND_RERANK_MODEL: ${FASTPDF_OPENRAG_BACKEND_RERANK_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N: ${FASTPDF_OPENRAG_BACKEND_RERANK_TOP_N:-8}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+    volumes:
+      - ${OPENRAG_FLOWS_PATH:-./state/flows}:/app/flows:U,z
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  opensearch:
+    image: langflowai/openrag-opensearch:${OPENRAG_VERSION:-latest}
+    container_name: os
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD}
+    command: >
+      bash -c "
+        sudo chown -R opensearch:opensearch /usr/share/opensearch/data || true
+        /usr/share/opensearch/opensearch-docker-entrypoint.sh opensearch &
+        sleep 10 && /usr/share/opensearch/setup-security.sh &
+        wait
+      "
+    ports:
+      - ${OPENSEARCH_PORT:-9200}:9200
+      - ${OPENSEARCH_METRICS_PORT:-9600}:9600
+    volumes:
+      - ${OPENSEARCH_DATA_PATH:-./state/opensearch-data}:/usr/share/opensearch/data:U,z
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:3.0.0
+    container_name: osdash
+    restart: unless-stopped
+    depends_on:
+      - opensearch
+    environment:
+      OPENSEARCH_HOSTS: '["https://${OPENSEARCH_HOST:-opensearch}:${OPENSEARCH_PORT:-9200}"]'
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
+    ports:
+      - ${DASHBOARDS_PORT:-5601}:5601
