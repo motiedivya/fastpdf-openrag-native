@@ -18,6 +18,7 @@ The compose file here includes the same major pieces used by the native repo:
 - `openrag-backend`
 - `openrag-frontend`
 - `langflow`
+- `docling`
 - `opensearch`
 - `opensearch-dashboards`
 - the native repo backend hotfix mounts:
@@ -26,7 +27,7 @@ The compose file here includes the same major pieces used by the native repo:
   - `openrag-hotfixes/session_manager.py`
 - backend/langflow rerank environment wiring
 
-Docling is still treated the same way your current setup treats it: as a host process started separately by `scripts/restart_stack.sh` unless you disable that behavior.
+This deploy package now includes a `docling` container in Compose, so the default server deployment is self-contained.
 
 ## Is the fastpdf bridge code needed here?
 
@@ -105,8 +106,8 @@ bash ./scripts/restart_stack.sh
 ```
 
 That script will:
-- optionally restart the host Docling process
-- start the compose services
+- optionally restart an external host Docling process if you explicitly enable it
+- start the compose services, including `docling`
 - run `fastpdf-openrag-native upgrade-openrag-flows`
 - apply the recommended knowledge settings
 - run `diagnose-stack`
@@ -135,12 +136,6 @@ If you want exact parity with the stack you are already running, use `scripts/ex
 
 ## Notes about Docling
 
-The current native setup expects Docling at `http://host.docker.internal:5001` from inside containers.
+The deploy package now includes a Compose-managed `docling` service on port `5001`, and the default internal URL is `http://docling:5001`.
 
-`scripts/restart_stack.sh` keeps that behavior and starts a host Docling process by default. If you already manage Docling elsewhere, set:
-
-```bash
-DOCLING_MANAGED=false bash ./scripts/restart_stack.sh
-```
-
-and point `DOCLING_SERVE_URL` at your external Docling endpoint in `.env`.
+If you want to use an external Docling instance instead, set `DOCLING_SERVE_URL` in `.env` to that endpoint. You only need `DOCLING_MANAGED=true` if you explicitly want `scripts/restart_stack.sh` to launch a separate host Docling process instead of relying on the bundled container.

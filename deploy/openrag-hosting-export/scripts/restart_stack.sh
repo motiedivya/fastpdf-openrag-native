@@ -21,7 +21,8 @@ set -a
 source "$ENV_FILE"
 set +a
 
-DOCLING_MANAGED="${DOCLING_MANAGED:-true}"
+DOCLING_MANAGED="${DOCLING_MANAGED:-false}"
+DOCLING_PORT="${DOCLING_PORT:-5001}"
 DOCLING_BIN="${DOCLING_BIN:-$HOME/.openrag/docling-venv/bin/docling-serve}"
 DOCLING_HOST="${DOCLING_HOST:-0.0.0.0}"
 DOCLING_BIND_PORT="${DOCLING_BIND_PORT:-5001}"
@@ -137,7 +138,8 @@ printf '[info] FASTPDF_OPENRAG_NATIVE_ROOT=%s
 
 validate_native_root
 restart_docling
-compose up -d --remove-orphans opensearch dashboards langflow openrag-backend openrag-frontend
+compose up -d --remove-orphans docling opensearch dashboards langflow openrag-backend openrag-frontend
+wait_for_http "http://127.0.0.1:${DOCLING_PORT:-5001}/health" "Docling" 90 2
 wait_for_http "http://127.0.0.1:${LANGFLOW_PORT:-7860}/health" "Langflow" 90 2
 wait_for_http "http://127.0.0.1:${FRONTEND_PORT:-3000}/" "OpenRAG Frontend" 90 2
 

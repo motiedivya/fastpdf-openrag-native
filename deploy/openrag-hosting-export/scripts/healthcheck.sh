@@ -37,5 +37,5 @@ check() {
 
 check "http://127.0.0.1:${FRONTEND_PORT:-3000}/" "OpenRAG Frontend"
 check "http://127.0.0.1:${LANGFLOW_PORT:-7860}/health" "Langflow"
-check "http://127.0.0.1:${DOCLING_BIND_PORT:-5001}/health" "Docling"
+check "http://127.0.0.1:${DOCLING_PORT:-5001}/health" "Docling"
 check "https://127.0.0.1:${OPENSEARCH_PORT:-9200}" "OpenSearch"

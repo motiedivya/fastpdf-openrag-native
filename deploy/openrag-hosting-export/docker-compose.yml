@@ -1,10 +1,21 @@
 services:
+  docling:
+    image: ${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:1.15.1}
+    container_name: docling
+    restart: unless-stopped
+    ports:
+      - ${DOCLING_PORT:-5001}:5001
+    environment:
+      DOCLING_SERVE_ENABLE_UI: ${DOCLING_SERVE_ENABLE_UI:-false}
+      DOCLING_SERVE_API_KEY: ${DOCLING_SERVE_API_KEY:-}
+
   openrag-backend:
     image: langflowai/openrag-backend:${OPENRAG_VERSION:-latest}
     container_name: openrag-backend
     restart: unless-stopped
     depends_on:
       - langflow
+      - docling
     environment:
       OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
       OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
@@ -103,7 +114,7 @@ services:
       OPENSEARCH_PORT: ${OPENSEARCH_PORT:-9200}
       OPENSEARCH_URL: https://${OPENSEARCH_HOST:-opensearch}:${OPENSEARCH_PORT:-9200}
       OPENSEARCH_INDEX_NAME: ${OPENSEARCH_INDEX_NAME:-documents}
-      DOCLING_SERVE_URL: ${DOCLING_SERVE_URL:-http://host.docker.internal:5001}
+      DOCLING_SERVE_URL: ${DOCLING_SERVE_URL:-http://docling:5001}
       FILENAME: None
       MIMETYPE: None
       FILESIZE: '0'
