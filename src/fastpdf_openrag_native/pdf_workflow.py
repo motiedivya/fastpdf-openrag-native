@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .models import (
     ChunkStats,
+    DEFAULT_MEDICAL_NOTE_OBJECTIVE,
+    MaterializedPage,
+    MaterializedRetrievalDocument,
     OpenSearchIndexDiagnostics,
     PdfPipelineResult,
     SummaryScope,
@@ -32,11 +36,7 @@ def _all_pages_scope(manifest, objective: str | None = None) -> SummaryScope:
         {
             "scope_id": "all-pages",
             "title": "All Pages Summary",
-            "objective": objective
-            or (
-                "Summarize each page independently, then build a grounded overall summary for the full PDF. "
-                "Preserve chronology and do not merge unrelated procedures."
-            ),
+            "objective": objective or DEFAULT_MEDICAL_NOTE_OBJECTIVE,
             "page_refs": [
                 {"pdf_id": page.pdf_id, "page": page.page}
                 for page in manifest.page_documents
@@ -57,6 +57,64 @@ def _build_chunk_stats(chunk_counts: dict[str, int]) -> ChunkStats:
     )
 
 
+def _build_chunk_audit(retrieval_documents: list[MaterializedRetrievalDocument]) -> dict[str, Any]:
+    lengths = [int(document.text_length or 0) for document in retrieval_documents if int(document.text_length or 0) > 0]
+    weak_samples: list[dict[str, Any]] = []
+    for document in retrieval_documents:
+        text_length = int(document.text_length or 0)
+        if text_length <= 0:
+            continue
+        if text_length <= 100:
+            weak_samples.append(
+                {
+                    "filename": document.source_filename,
+                    "pdf_id": document.pdf_id,
+                    "page": document.page,
+                    "section_title": document.section_title,
+                    "text_length": text_length,
+                    "text_start": str(document.text_preview or "").strip()[:140],
+                }
+            )
+        if len(weak_samples) >= 12:
+            break
+
+    return {
+        "total_chunks": len(lengths),
+        "median_chunk_length": statistics.median(lengths) if lengths else 0,
+        "chunks_under_30_chars": sum(1 for length in lengths if length < 30),
+        "chunks_under_50_chars": sum(1 for length in lengths if length < 50),
+        "chunks_under_100_chars": sum(1 for length in lengths if length < 100),
+        "weak_chunk_samples": weak_samples,
+    }
+
+
+def _build_page_chunk_audit(page_documents: list[MaterializedPage]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for page in sorted(page_documents, key=lambda item: (item.order_index, item.pdf_id, item.page)):
+        metadata = dict(page.metadata or {})
+        chunk_previews = [
+            str(preview).strip()[:160]
+            for preview in (metadata.get("chunk_previews") or [])
+            if str(preview or "").strip()
+        ]
+        rows.append(
+            {
+                "pdf_id": page.pdf_id,
+                "page": page.page,
+                "source_filename": page.source_filename,
+                "source_text_strategy": metadata.get("source_text_strategy"),
+                "chunk_text_strategy": metadata.get("chunk_text_strategy"),
+                "native_text_chars": int(metadata.get("native_text_chars") or 0),
+                "ocr_paragraph_count": int(metadata.get("ocr_paragraph_count") or metadata.get("paragraph_count") or 0),
+                "indexed_chunk_count": int(metadata.get("indexed_chunk_count") or len(page.retrieval_filenames or [])),
+                "native_text_guardrail_triggered": bool(metadata.get("native_text_guardrail_triggered")),
+                "native_text_guardrail_reason": metadata.get("native_text_guardrail_reason"),
+                "chunk_previews": chunk_previews[:5],
+            }
+        )
+    return rows
+
+
 def _format_exception_message(exc: BaseException, *, fallback: str = "summary generation failed") -> str:
     detail = str(exc).strip()
     error_type = type(exc).__name__
@@ -71,6 +129,8 @@ def _build_retrieval_debug_payload(
     *,
     diagnostics: OpenSearchIndexDiagnostics | None,
     chunk_stats: ChunkStats,
+    chunk_audit: dict[str, Any] | None,
+    page_chunk_audit: list[dict[str, Any]] | None,
     source_pages: int,
     retrieval_documents: int,
 ) -> dict[str, Any]:
@@ -106,6 +166,8 @@ def _build_retrieval_debug_payload(
         "source_pages_in_run": source_pages,
         "retrieval_documents_in_run": retrieval_documents,
         "chunk_stats": chunk_stats.model_dump(mode="json"),
+        "chunk_audit": dict(chunk_audit or {}),
+        "page_chunk_audit": list(page_chunk_audit or []),
         "notes": [],
     }
 
@@ -129,6 +191,21 @@ def _build_retrieval_debug_payload(
     if diagnostics and diagnostics.reranker_location == "langflow_agent_tool":
         notes.append(
             "OpenRAG chat now depends on a Langflow-backed retrieval tool that reranks hybrid OpenSearch hits before they reach generation."
+        )
+    if chunk_audit and int(chunk_audit.get("chunks_under_50_chars") or 0) > 0:
+        notes.append(
+            "Chunk audit found very short retrieval chunks; inspect `chunk_audit.weak_chunk_samples` if medical-note quality regresses."
+        )
+    if page_chunk_audit and any(item.get("native_text_guardrail_triggered") for item in page_chunk_audit):
+        notes.append(
+            "Native-text guardrail rebuilt sparse born-digital page chunks from the richer text layer before summary."
+        )
+    if page_chunk_audit and any(
+        int(item.get("native_text_chars") or 0) >= 800 and int(item.get("indexed_chunk_count") or 0) < 3
+        for item in page_chunk_audit
+    ):
+        notes.append(
+            "At least one born-digital page still has fewer than 3 indexed chunks; inspect `page_chunk_audit` before trusting the native summary."
         )
     return payload
 
@@ -429,6 +506,8 @@ async def run_pdf_pipeline(
             break
 
     chunk_stats = _build_chunk_stats(chunk_counts)
+    chunk_audit = _build_chunk_audit(list(manifest.retrieval_documents))
+    page_chunk_audit = _build_page_chunk_audit(list(manifest.page_documents))
     if summary is None and summary_path is None and not summary_error:
         summary_error = "RuntimeError: summary generation did not produce artifacts"
 
@@ -436,7 +515,11 @@ async def run_pdf_pipeline(
         stage="opensearch",
         service="opensearch",
         action="summarize_chunk_inventory",
-        response=chunk_stats.model_dump(mode="json"),
+        response={
+            "chunk_stats": chunk_stats.model_dump(mode="json"),
+            "chunk_audit": chunk_audit,
+            "page_chunk_audit": page_chunk_audit,
+        },
     )
 
     diagnostics_after = await _safe_diagnostics(inspector, trace)
@@ -487,6 +570,8 @@ async def run_pdf_pipeline(
         summary.debug["retrieval_runtime"] = _build_retrieval_debug_payload(
             diagnostics=diagnostics,
             chunk_stats=chunk_stats,
+            chunk_audit=chunk_audit,
+            page_chunk_audit=page_chunk_audit,
             source_pages=len(manifest.page_documents),
             retrieval_documents=len(ingest_documents),
         )

@@ -144,8 +144,10 @@ Do not write narrative prose.
 Do not include citations, source filenames, markdown, or commentary.
 Do not invent or infer missing facts.
 Include only positive or abnormal findings; exclude normal findings unless they are the only supported content on the page.
+Suppress header, footer, and administrative metadata such as address, phone, fax, email, website, routing text, page numbers, file numbers, and other contact fragments unless they are required to preserve facility, provider, patient, or service-date context.
+Do not turn address fragments or contact metadata into medical facts or residual facts.
 Preserve exact dates, callback numbers, medication doses/frequencies, units, ICD codes, and procedure details when present.
-If a supported detail does not fit a named field, place it in residual_supported_facts.
+If a supported detail does not fit a named field, place it in residual_supported_facts only when it is clinically or operationally meaningful.
 
 Metadata hints:
 {metadata_block}
@@ -215,6 +217,11 @@ Do not chain many facts with semicolons.
 Do not merge unrelated fields into one sentence.
 Prefer one coherent fact cluster per item.
 Preserve exact medical wording for anatomy, imaging, diagnoses, ICD codes, doses, and units when present.
+Start each populated note/date section with `On {{date_of_service}},` when a date of service is available.
+Include facility, provider, and patient reference in the opening sentence when they are present in the truth layer.
+Preserve populated chief complaint/HPI, PMH/PSH/social history, allergies/medications, diagnoses/ICD codes, assessment, treatment, plan, and follow-up fields when they exist.
+Never describe the output as a page summary and never use phrases like `this page`, `this document`, or `the page states`.
+Do not surface address, phone, fax, email, website, page header/footer, or routing metadata as key points or narrative sentences.
 Omit normal or negative boilerplate unless it is the only supported content for that note/date.
 
 Truth layer JSON:
@@ -267,7 +274,12 @@ You may merge or split draft sentences for readability, but you must preserve al
 Keep one coherent fact cluster per sentence.
 Do not merge exam findings with ROS boilerplate, diagnosis with plan, or history with unrelated imaging details.
 Prefer exact medical wording for anatomy, imaging, diagnoses, ICD codes, doses, and units.
-Reject vague endings and incomplete anatomical phrases.
+Start each populated note/date section with `On {{date_of_service}},` when a date of service is available.
+Include facility, provider, and patient reference in the opening sentence when they are present in the truth layer.
+Preserve populated chief complaint/HPI, PMH/PSH/social history, allergies/medications, diagnoses/ICD codes, assessment, treatment, plan, and follow-up fields when they exist.
+Never describe the output as a page summary and never use phrases like `this page`, `this document`, or `the page states`.
+Remove address, phone, fax, email, website, page header/footer, and routing metadata unless it is necessary to preserve facility, provider, patient, or date context.
+Reject vague endings, broken address fragments, and incomplete anatomical phrases.
 Return valid JSON only.
 
 Truth layer JSON:

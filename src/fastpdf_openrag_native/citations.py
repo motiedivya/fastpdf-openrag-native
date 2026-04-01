@@ -81,6 +81,7 @@ class _GroundingItem:
     section_id: str
     candidate_filenames: list[str]
     preferred_filenames: list[str] = field(default_factory=list)
+    evidence_texts: list[str] = field(default_factory=list)
     expected_pdf_id: str | None = None
     expected_page: int | None = None
     supported: bool | None = None
@@ -305,6 +306,41 @@ def _load_html_paragraphs(html_path: Path) -> list[dict[str, Any]]:
     return parser.paragraphs
 
 
+def _scale_paragraph_boxes(
+    paragraphs: list[dict[str, Any]],
+    *,
+    bbox_space: str | None,
+    width: int | None,
+    height: int | None,
+) -> list[dict[str, Any]]:
+    if bbox_space != "normalized_1000" or not width or not height:
+        return paragraphs
+
+    scale_x = float(width) / 1000.0
+    scale_y = float(height) / 1000.0
+    scaled: list[dict[str, Any]] = []
+    for paragraph in paragraphs:
+        bbox = dict(paragraph.get("bbox") or {})
+        left = int(round(float(bbox.get("left") or 0) * scale_x))
+        top = int(round(float(bbox.get("top") or 0) * scale_y))
+        right = int(round(float(bbox.get("right") or 0) * scale_x))
+        bottom = int(round(float(bbox.get("bottom") or 0) * scale_y))
+        scaled.append(
+            {
+                **paragraph,
+                "bbox": {
+                    "left": left,
+                    "top": top,
+                    "right": right,
+                    "bottom": bottom,
+                    "width": max(0, right - left),
+                    "height": max(0, bottom - top),
+                },
+            }
+        )
+    return scaled
+
+
 def _copy_source_pdf(source_pdf: Path | None, extraction_dir: Path) -> Path | None:
     if source_pdf is None or not source_pdf.exists():
         return None
@@ -374,6 +410,12 @@ def _build_page_assets(
             rendered_width = rendered_width or fallback_width
             rendered_height = rendered_height or fallback_height
         paragraphs = _load_html_paragraphs(html_path) if html_path.exists() else []
+        paragraphs = _scale_paragraph_boxes(
+            paragraphs,
+            bbox_space=str(page.metadata.get("bbox_space") or "").strip() or None,
+            width=rendered_width,
+            height=rendered_height,
+        )
         by_block_paragraph = {
             (paragraph["block_index"], paragraph["paragraph_index"]): paragraph
             for paragraph in paragraphs
@@ -472,6 +514,7 @@ def _expand_verified_items(
 ) -> list[_GroundingItem]:
     items: list[_GroundingItem] = []
     for sentence_index, value in enumerate(values, start=1):
+        evidence_texts = _dedupe_preserve_order(str(hit.text or "") for hit in value.evidence)
         for part_index, text in enumerate(_split_grounding_units(value.sentence), start=1):
             items.append(
                 _GroundingItem(
@@ -480,6 +523,7 @@ def _expand_verified_items(
                     section_id=section_id,
                     candidate_filenames=list(candidate_filenames),
                     preferred_filenames=_dedupe_preserve_order(hit.filename for hit in value.evidence),
+                    evidence_texts=list(evidence_texts),
                     expected_pdf_id=default_pdf_id,
                     expected_page=_extract_page_hint(text) or default_page,
                     supported=value.supported,
@@ -498,11 +542,13 @@ def _expand_text_items(
     default_page: int | None = None,
     supported: bool | None = None,
     preferred_filenames: list[str] | None = None,
+    evidence_texts: list[str] | None = None,
     debug_only: bool = False,
 ) -> list[_GroundingItem]:
     items: list[_GroundingItem] = []
     counter = 0
     preferred = list(preferred_filenames or [])
+    evidence_snippets = list(evidence_texts or [])
     for value in values:
         for part_index, text in enumerate(_split_grounding_units(str(value or "")), start=1):
             counter += 1
@@ -513,6 +559,7 @@ def _expand_text_items(
                     section_id=section_id,
                     candidate_filenames=list(candidate_filenames),
                     preferred_filenames=list(preferred),
+                    evidence_texts=list(evidence_snippets),
                     expected_pdf_id=default_pdf_id,
                     expected_page=_extract_page_hint(text) or default_page,
                     supported=supported,
@@ -554,6 +601,7 @@ def _build_sections(
                         default_page=item_page,
                         supported=True,
                         preferred_filenames=[hit.filename for hit in rendered_item.evidence],
+                        evidence_texts=[str(hit.text or "") for hit in rendered_item.evidence],
                     )
                 )
             if items:
@@ -622,6 +670,7 @@ def _build_sections(
                 default_page=page_summary.page,
                 supported=page_summary.passed_verification,
                 preferred_filenames=[hit.filename for hit in page_summary.retrieved_sources],
+                evidence_texts=[str(hit.text or "") for hit in page_summary.retrieved_sources],
             )
             if items:
                 sections.append((section, items))
@@ -643,6 +692,7 @@ def _build_sections(
                 default_page=page_summary.page,
                 supported=True,
                 preferred_filenames=[hit.filename for hit in page_summary.retrieved_sources],
+                evidence_texts=[str(hit.text or "") for hit in page_summary.retrieved_sources],
             )
             if items:
                 sections.append((section, items))
@@ -664,6 +714,7 @@ def _build_sections(
                 default_page=page_summary.page,
                 supported=False,
                 preferred_filenames=[hit.filename for hit in page_summary.retrieved_sources],
+                evidence_texts=[str(hit.text or "") for hit in page_summary.retrieved_sources],
                 debug_only=True,
             )
             if items:
@@ -686,6 +737,7 @@ def _build_sections(
                 default_page=page_summary.page,
                 supported=False,
                 preferred_filenames=[hit.filename for hit in page_summary.retrieved_sources],
+                evidence_texts=[str(hit.text or "") for hit in page_summary.retrieved_sources],
                 debug_only=True,
             )
             if items:
@@ -814,13 +866,43 @@ def _paragraphs_from_ranges(asset: _PageAsset, metadata: dict[str, Any]) -> tupl
     return [], "no_range_match"
 
 
-def _paragraphs_from_fuzzy_match(asset: _PageAsset, sentence: str, chunk_text: str) -> list[dict[str, Any]]:
+def _narrow_paragraph_matches(
+    paragraphs: list[dict[str, Any]],
+    *,
+    reference_texts: list[str],
+) -> list[dict[str, Any]]:
+    if len(paragraphs) <= 1:
+        return paragraphs
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for paragraph in paragraphs:
+        paragraph_text = str(paragraph.get("text") or "")
+        score = max((_score_text_similarity(reference, paragraph_text) for reference in reference_texts), default=0.0)
+        if score <= 0:
+            continue
+        scored.append((score, paragraph))
+    if not scored:
+        return paragraphs
+
+    scored.sort(key=lambda row: row[0], reverse=True)
+    top_score = scored[0][0]
+    if top_score < 0.2:
+        return paragraphs
+
+    threshold = max(0.32, top_score * 0.78)
+    selected = [paragraph for score, paragraph in scored[:6] if score >= threshold]
+    if not selected:
+        selected = [scored[0][1]]
+
+    selected.sort(key=lambda row: int(row.get("page_paragraph_index") or 0))
+    return selected
+
+
+def _paragraphs_from_fuzzy_match(asset: _PageAsset, reference_texts: list[str]) -> list[dict[str, Any]]:
     scored: list[tuple[float, dict[str, Any]]] = []
     for paragraph in asset.paragraphs:
-        score = max(
-            _score_text_similarity(sentence, paragraph.get("text") or ""),
-            _score_text_similarity(chunk_text, paragraph.get("text") or ""),
-        )
+        paragraph_text = paragraph.get("text") or ""
+        score = max((_score_text_similarity(reference, paragraph_text) for reference in reference_texts), default=0.0)
         if score <= 0:
             continue
         scored.append((score, paragraph))
@@ -838,17 +920,17 @@ def _resolve_paragraphs(
     *,
     chunk: _ChunkDocument,
     asset: _PageAsset | None,
-    sentence: str,
+    reference_texts: list[str],
 ) -> tuple[list[dict[str, Any]], str]:
     if asset is None or not asset.paragraphs:
         return [], "page_only"
     exact = _paragraphs_from_exact_refs(asset, chunk.metadata.get("paragraph_refs"))
     if exact:
-        return exact, "exact_refs"
+        return _narrow_paragraph_matches(exact, reference_texts=reference_texts), "exact_refs"
     ranged, range_strategy = _paragraphs_from_ranges(asset, chunk.metadata)
     if ranged:
-        return ranged, range_strategy
-    fuzzy = _paragraphs_from_fuzzy_match(asset, sentence, chunk.text)
+        return _narrow_paragraph_matches(ranged, reference_texts=reference_texts), range_strategy
+    fuzzy = _paragraphs_from_fuzzy_match(asset, reference_texts)
     if fuzzy:
         return fuzzy, "fuzzy_paragraph_match"
     return [], "page_only"
@@ -886,13 +968,19 @@ def _ground_item(
         candidate_filenames = page_sources.get((item.expected_pdf_id, item.expected_page), candidate_filenames)
     ordered_candidates = _dedupe_preserve_order([*item.preferred_filenames, *candidate_filenames])
     sentence_text = _clean_grounding_text(item.text)
+    reference_texts = [sentence_text]
+    reference_texts.extend(
+        text
+        for text in (_clean_grounding_text(value) for value in item.evidence_texts)
+        if text and text not in reference_texts
+    )
     candidates: list[tuple[float, _ChunkDocument]] = []
     preferred_rank = {filename: index for index, filename in enumerate(item.preferred_filenames)}
     for filename in ordered_candidates:
         chunk = chunk_lookup.get(filename)
         if chunk is None:
             continue
-        score = _score_text_similarity(sentence_text, chunk.text)
+        score = max((_score_text_similarity(reference, chunk.text) for reference in reference_texts), default=0.0)
         if filename in preferred_rank:
             score += max(0.08, 0.18 - (preferred_rank[filename] * 0.03))
         if item.expected_pdf_id:
@@ -915,6 +1003,7 @@ def _ground_item(
         "expected_pdf_id": item.expected_pdf_id,
         "expected_page": item.expected_page,
         "preferred_filenames": list(item.preferred_filenames),
+        "reference_text_count": len(reference_texts),
     }
 
     best_score = candidates[0][0] if candidates else 0.0
@@ -956,7 +1045,11 @@ def _ground_item(
     if asset is None:
         asset = page_assets_by_key.get((best_chunk.pdf_id, best_chunk.page))
 
-    paragraphs, match_strategy = _resolve_paragraphs(chunk=best_chunk, asset=asset, sentence=sentence_text)
+    paragraphs, match_strategy = _resolve_paragraphs(
+        chunk=best_chunk,
+        asset=asset,
+        reference_texts=reference_texts + [best_chunk.text],
+    )
     boxes = [
         CitationBox(
             text=str(paragraph.get("text") or ""),
@@ -1170,6 +1263,8 @@ def build_resolved_citations(
         if resolved_items:
             resolved_sections.append(section.model_copy(update={"items": resolved_items}))
 
+    page_only_count = strategy_counts.get("page_only", 0)
+    citations_with_boxes = sum(1 for instance in citation_instances if instance.boxes)
     resolved = ResolvedCitations(
         citation_index=list(citation_order),
         citation_instances=list(citation_instances),
@@ -1181,6 +1276,10 @@ def build_resolved_citations(
             "citation_count": len(citation_instances),
             "evidence_catalog_count": len(citation_order),
             "strategy_counts": strategy_counts,
+            "page_only_count": page_only_count,
+            "page_only_ratio": round(page_only_count / max(len(citation_instances), 1), 4),
+            "citations_with_boxes_count": citations_with_boxes,
+            "citations_with_boxes_ratio": round(citations_with_boxes / max(len(citation_instances), 1), 4),
         },
     )
     summary_with_citations = summary.model_copy(

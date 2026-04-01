@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from .citations import ensure_summary_citations
 from .fastpdf_loader import load_run_from_mongo, load_run_json, materialize_summary_payload
 from .langflow import LangflowGateway
+from .models import DEFAULT_MEDICAL_NOTE_OBJECTIVE
 from .openrag import OpenRAGGateway
 from .opensearch import OpenSearchInspector
 from .pdf_workflow import _all_pages_scope, run_pdf_pipeline
@@ -390,6 +391,7 @@ async def _run_job(
 def _render_home() -> str:
     _load_jobs_from_store()
     jobs = sorted((_recover_job_artifacts(row) for row in _jobs.values()), key=lambda row: row.get("job_id", ""), reverse=True)
+    default_objective = html.escape(DEFAULT_MEDICAL_NOTE_OBJECTIVE)
     job_rows = "\n".join(
         (
             "<tr>"
@@ -431,7 +433,7 @@ def _render_home() -> str:
       <label>Google Vision credentials path</label>
       <input name="credentials_path" value="/home/divyesh-nandlal-vishwakarma/Downloads/ocr-neuralit-4e01e06ccf84(2).json" />
       <label>Summary objective</label>
-      <textarea name="question">Summarize every page independently, then provide a grounded overall summary and chronology.</textarea>
+      <textarea name="question">{default_objective}</textarea>
       <label>Max pages (optional)</label>
       <input name="max_pages" type="number" min="1" />
       <button type="submit">Run Pipeline</button>
@@ -1567,12 +1569,22 @@ def _render_summary_page(job_id: str) -> str:
     }
 
     function pageForCitation(citation) {
+      const sourcePages = Array.isArray(state.model?.source_pages) ? state.model.source_pages : [];
       if (citation?.page_key && state.pageByKey.has(String(citation.page_key))) {
         return state.pageByKey.get(String(citation.page_key)) || null;
       }
-      return Array.isArray(state.model?.source_pages) && state.model.source_pages.length
-        ? state.model.source_pages[0]
-        : null;
+      if (citation) {
+        const exactPage = sourcePages.find((page) => (
+          String(page?.pdf_id || "") === String(citation?.pdf_id || "")
+          && Number(page?.page || 0) === Number(citation?.page || 0)
+        ));
+        if (exactPage) return exactPage;
+      }
+      return sourcePages.length ? sourcePages[0] : null;
+    }
+
+    function citationHasRegionMapping(citation) {
+      return Number(citation?.bbox?.width || 0) > 0 && Number(citation?.bbox?.height || 0) > 0;
     }
 
     function getViewerPageElement(pageKey) {
@@ -1761,7 +1773,7 @@ def _render_summary_page(job_id: str) -> str:
         textLayer.className = "pdf-text-layer";
         stage.appendChild(textLayer);
 
-        if (isTargetPage && citation?.bbox?.width && citation?.bbox?.height && !citation.degraded) {
+        if (isTargetPage && citationHasRegionMapping(citation)) {
           const union = document.createElement("div");
           union.className = "citation-union";
           union.style.left = `${(citation.bbox.left || 0) * scale}px`;
@@ -1797,8 +1809,10 @@ def _render_summary_page(job_id: str) -> str:
         caption.className = "pdf-page-meta";
         if (!citation) {
           caption.textContent = `Available source page ${page.page} for ${page.pdf_id}.`;
-        } else if (isTargetPage && citation.degraded && state.debugMode) {
+        } else if (isTargetPage && citation.degraded && state.debugMode && !citationHasRegionMapping(citation)) {
           caption.textContent = `Degraded citation mapping on ${page.pdf_id} page ${page.page}. The page is correct, but the highlight falls back to page-level evidence.`;
+        } else if (isTargetPage && citation && !citationHasRegionMapping(citation)) {
+          caption.textContent = `Showing page-level evidence on ${page.pdf_id} page ${page.page}. Open the source PDF for broader context.`;
         } else if (isTargetPage) {
           caption.textContent = `Matched OCR paragraphs on ${page.pdf_id} page ${page.page}. Click a highlighted region to return to the linked summary sentence.`;
         } else {
@@ -1837,7 +1851,7 @@ def _render_summary_page(job_id: str) -> str:
         return;
       }
       el.activeTitle.textContent = `${citation.pdf_id} · Page ${citation.page}`;
-      el.activeMeta.textContent = state.debugMode && citation.degraded
+      el.activeMeta.textContent = state.debugMode && citation.degraded && !citationHasRegionMapping(citation)
         ? `${citation.snippet || citation.label} • degraded mapping fallback on page ${citation.page}`
         : `${citation.snippet || citation.label}`;
       el.debugBlock.hidden = !state.debugMode;

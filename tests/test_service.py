@@ -91,6 +91,8 @@ def test_render_summary_page_uses_batch_style_pdf_viewer_and_click_only_markers(
     assert "pdf-text-layer" in html
     assert "citation-box" in html
     assert "computeDisplayScale" in html
+    assert "citationHasRegionMapping" in html
+    assert "Number(page?.page || 0) === Number(citation?.page || 0)" in html
     assert "sentence-meta" in html
     assert 'href="/ui/runs/job-1"' in html
     assert 'href="/ui/runs/job-1/trace"' in html

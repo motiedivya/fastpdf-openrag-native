@@ -75,6 +75,68 @@ POSITIVE_PRESENTATION_SIGNAL_RE = re.compile(
     r"\b(?:pain|tender|swelling|infection|hearing loss|otalgia|abnormal|positive|limited|decreased|effusion|erythema|lesion|mass|ulcer|callback|clearance|procedure|block|injection|diagnosis|plan|follow[- ]?up|medication|allerg(?:y|ies)|icd|hpi|chief complaint)\b",
     flags=re.IGNORECASE,
 )
+PROTECTED_ABBREVIATION_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"\bM\.D\.",
+        r"\bD\.O\.",
+        r"\bPh\.D\.",
+        r"\bDr\.",
+        r"\bMr\.",
+        r"\bMrs\.",
+        r"\bMs\.",
+        r"\bProf\.",
+        r"\bNo\.(?=\s*\d)",
+        r"\bSte\.",
+        r"\bSt\.",
+        r"\bAve\.",
+        r"\bBlvd\.",
+        r"\bRd\.",
+        r"\bCt\.",
+        r"\bLn\.",
+        r"\bPkwy\.",
+        r"\b[NEWS]\.(?=\s+(?:\d|[A-Z]))",
+        r"\bvs\.",
+        r"\betc\.",
+    )
+)
+INITIAL_PATTERN = re.compile(r"\b[A-Z]\.(?=\s+[A-Z][a-z])")
+INITIAL_SERIES_PATTERN = re.compile(r"\b(?:[A-Z]\.){2,}")
+CLINICAL_VALUE_SIGNAL_RE = re.compile(
+    r"\b(?:pain|injur(?:y|ies)|accident|mva|history|diagnos(?:is|es)|icd|assessment|plan|treat(?:ment|ed)?|procedure|effusion|tender(?:ness)?|positive|limited|decreased|tear|meniscus|mri|imaging|allerg(?:y|ies)|medication|dose|therapy|follow[- ]?up|hypertension|cholesterol|tobacco|alcohol|surgery|gallbladder|hysterectomy|lap band|aleve|injection|complaint|mechanism of injury)\b",
+    flags=re.IGNORECASE,
+)
+ADMIN_METADATA_SIGNAL_RE = re.compile(
+    r"\b(?:address|phone|fax|email|website|page\s+\d+\s+of\s+\d+|confidential(?:ity)?|routing|printed\s+(?:by|on)|cover sheet|member id|guarantor|policy|subscriber|file\s*#?|dob|mrn|ssn|po box)\b",
+    flags=re.IGNORECASE,
+)
+ADDRESS_COMPONENT_RE = re.compile(
+    r"\b\d{1,5}\s+(?:[NEWS]\.?\s+)?(?:[A-Za-z0-9#.'-]+\s+){0,6}(?:St\.?|Street|Ave\.?|Avenue|Rd\.?|Road|Blvd\.?|Boulevard|Dr\.?|Drive|Ln\.?|Lane|Ct\.?|Court|Way|Pkwy\.?|Parkway)(?:,?\s*(?:Ste\.?|Suite)\s*[A-Za-z0-9-]+)?(?:\s+[A-Za-z .'-]+,?\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)?",
+    flags=re.IGNORECASE,
+)
+BROKEN_FRAGMENT_RE = re.compile(
+    r"^(?:\d{1,5}\s+[NEWS]\.?|(?:[0-9A-Za-z.'-]+\s+){0,2}(?:St\.?|Ave\.?|Rd\.?|Blvd\.?|Ste\.?|Suite)|[NEWS]\.|page\s+\d+\s+of\s+\d+)$",
+    flags=re.IGNORECASE,
+)
+LOW_VALUE_SUBCLAUSE_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"(?:,?\s*and\s+)?reflexes?\s*2\+\s+bilaterally(?:\s+in\s+(?:the\s+)?(?:upper|lower)\s+extremities)?",
+        r"(?:,?\s*and\s+)?sensation\s+intact(?:\s+to\s+light\s+touch)?",
+        r"(?:,?\s*and\s+)?(?:muscle\s+strength\s+(?:in\s+the\s+upper\s+and\s+lower\s+extremities\s+)?(?:\(bilaterally\)\s+)?was\s+evaluated\s+and\s+found\s+to\s+be\s+5/5\s*\(?normal\)?|5/5\s*\(?normal\)?)",
+        r"(?:,?\s*and\s+)?review of systems (?:was )?otherwise negative(?: except as noted)?",
+        r"(?:,?\s*and\s+)?otherwise negative(?: except as noted)?",
+        r"(?:,?\s*and\s+)?appropriate mood(?: and affect)?",
+        r"(?:,?\s*and\s+)?clear fluent speech",
+        r"(?:,?\s*and\s+)?orientation\s*x?3",
+        r"(?:,?\s*and\s+)?alert and oriented(?: status)?",
+        r"(?:,?\s*and\s+)?unremarkable cranial nerve exam",
+        r"(?:,?\s*and\s+)?cranial nerves grossly intact",
+        r"(?:,?\s*and\s+)?normal gait",
+        r"(?:,?\s*and\s+)?well[- ]appearing(?: and in no acute distress)?",
+    )
+)
+METADATA_FIELD_NAMES = {"date_of_service", "facility", "provider", "patient_reference", "note_type"}
 
 PRESENTATION_FIELD_ORDER = (
     "chief_complaint",
@@ -179,14 +241,47 @@ def _ensure_sentence(text: str) -> str:
     return clean
 
 
+def _protect_sentence_tokens(text: str) -> tuple[str, dict[str, str]]:
+    protected = text
+    replacements: dict[str, str] = {}
+    counter = 0
+
+    def reserve(raw: str) -> str:
+        nonlocal counter
+        token = f"__FASTPDF_LAYERED_SENT_{counter}__"
+        counter += 1
+        replacements[token] = raw
+        return token
+
+    for pattern in PROTECTED_ABBREVIATION_PATTERNS:
+        protected = pattern.sub(lambda match: reserve(match.group(0)), protected)
+    protected = INITIAL_SERIES_PATTERN.sub(lambda match: reserve(match.group(0)), protected)
+    protected = INITIAL_PATTERN.sub(lambda match: reserve(match.group(0)), protected)
+    return protected, replacements
+
+
+def _restore_sentence_tokens(text: str, replacements: dict[str, str]) -> str:
+    restored = text
+    for token, raw in replacements.items():
+        restored = restored.replace(token, raw)
+    return restored
+
+
 def _split_sentences(text: str) -> list[str]:
     clean = _sanitize_generated_text(text)
     if not clean:
         return []
     clean = re.sub(r"\s*[•;]\s*", ". ", clean)
     clean = re.sub(r"\s*\n+\s*", " ", clean)
-    parts = re.split(r"(?<=[.!?])\s+", clean)
-    return [sentence for sentence in (_ensure_sentence(part) for part in parts) if sentence]
+    protected, replacements = _protect_sentence_tokens(clean)
+    parts = re.split(r"(?<=[.!?])\s+", protected)
+    sentences: list[str] = []
+    for part in parts:
+        restored = _restore_sentence_tokens(part, replacements)
+        sentence = _ensure_sentence(restored)
+        if sentence:
+            sentences.append(sentence)
+    return sentences
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -207,14 +302,87 @@ def _clean_fact_value(text: str) -> str:
     return clean
 
 
-def _extract_string_list(value: Any) -> list[str]:
+def _looks_like_admin_metadata(text: str) -> bool:
+    clean = _sanitize_generated_text(text)
+    if not clean:
+        return False
+    has_admin_signal = bool(ADMIN_METADATA_SIGNAL_RE.search(clean) or ADDRESS_COMPONENT_RE.search(clean))
+    if not has_admin_signal:
+        return False
+    has_clinical_signal = bool(
+        CLINICAL_VALUE_SIGNAL_RE.search(clean)
+        or ICD_RE.search(clean)
+        or MEDICATION_SIGNAL_RE.search(clean)
+        or ALLERGY_SIGNAL_RE.search(clean)
+        or DATE_RE.search(clean)
+    )
+    return has_admin_signal and not has_clinical_signal
+
+
+def _looks_like_broken_fragment(text: str) -> bool:
+    clean = _clean_fact_value(text)
+    if not clean:
+        return False
+    if ICD_RE.search(clean) or MEDICATION_SIGNAL_RE.search(clean) or ALLERGY_SIGNAL_RE.search(clean):
+        return False
+    token_count = len(clean.split())
+    if token_count <= 4 and BROKEN_FRAGMENT_RE.search(clean):
+        return True
+    if token_count <= 6 and ADDRESS_COMPONENT_RE.search(clean) and not CLINICAL_VALUE_SIGNAL_RE.search(clean):
+        return True
+    if token_count <= 5 and re.search(r"\b(?:st\.?|street|ave\.?|avenue|rd\.?|road|blvd\.?|boulevard|dr\.?|drive|ste\.?|suite)\b", clean, flags=re.IGNORECASE) and not CLINICAL_VALUE_SIGNAL_RE.search(clean):
+        return True
+    return False
+
+
+def _strip_low_value_clauses(text: str) -> str:
+    clean = _sanitize_generated_text(text)
+    if not clean:
+        return ""
+    for pattern in LOW_VALUE_SUBCLAUSE_PATTERNS:
+        clean = pattern.sub("", clean)
+    clean = re.sub(r"\s{2,}", " ", clean)
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
+    clean = re.sub(r"([,;:])(?:\s*[,:;])+", r"\1", clean)
+    clean = re.sub(r"(?:,\s*){2,}", ", ", clean)
+    clean = re.sub(r"\b(?:and|with)\s*(?=[,.;]|$)", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"^[,;:\s]+|[,;:\s]+$", "", clean)
+    return _clean_fact_value(clean)
+
+
+def _should_drop_fact_value(field_name: str | None, text: str) -> bool:
+    clean = _clean_fact_value(text)
+    if not clean:
+        return True
+    if field_name in METADATA_FIELD_NAMES:
+        return False
+    if _looks_like_broken_fragment(clean):
+        return True
+    if _looks_like_admin_metadata(clean):
+        return True
+    if field_name in {"positive_ros", "positive_physical_exam", "residual_supported_facts"} and _looks_like_normal_finding(clean):
+        return True
+    return False
+
+
+def _extract_string_list(value: Any, *, field_name: str | None = None) -> list[str]:
     if isinstance(value, str):
         values = [value]
     elif isinstance(value, list):
         values = [item for item in value if isinstance(item, str)]
     else:
         return []
-    return _dedupe_preserve_order([_clean_fact_value(item) for item in values if _clean_fact_value(item)])
+
+    cleaned_values: list[str] = []
+    for item in values:
+        clean = _clean_fact_value(item)
+        if field_name not in METADATA_FIELD_NAMES:
+            clean = _strip_low_value_clauses(clean)
+        clean = _clean_fact_value(clean)
+        if not clean or _should_drop_fact_value(field_name, clean):
+            continue
+        cleaned_values.append(clean)
+    return _dedupe_preserve_order(cleaned_values)
 
 
 def _token_set(text: str) -> set[str]:
@@ -355,7 +523,7 @@ def _note_from_payload(
     fallback_hits = list(page_summary.retrieved_sources[:3])
     metadata_hints = _metadata_hints_for_page(page)
     for field_name in TRUTH_FIELD_NAMES:
-        values = _extract_string_list(payload.get(field_name))
+        values = _extract_string_list(payload.get(field_name), field_name=field_name)
         for value in values:
             _append_fact(getattr(note, field_name), _build_supported_fact(value, verified_rows, fallback_hits))
     if metadata_hints.get("service_date") and not note.date_of_service:
@@ -368,12 +536,18 @@ def _note_from_payload(
         *[_ensure_sentence(item) for item in (page_summary.supported_key_facts or page_summary.key_facts)],
     ])
     existing_values = [value for field_name in TRUTH_FIELD_NAMES for value in note.field_values(field_name)]
-    for unit in source_units:
-        if any(_fact_overlap_score(unit, existing) >= 0.72 for existing in existing_values):
+    filtered_source_units: list[str] = []
+    for raw_unit in source_units:
+        clean_unit = _strip_low_value_clauses(raw_unit)
+        clean_unit = _clean_fact_value(clean_unit)
+        if not clean_unit or _should_drop_fact_value("residual_supported_facts", clean_unit):
             continue
-        _append_fact(note.residual_supported_facts, _build_supported_fact(unit, verified_rows, fallback_hits))
-        existing_values.append(unit)
-    note.debug = {"metadata_hints": metadata_hints, "source_units": source_units}
+        filtered_source_units.append(clean_unit)
+        if any(_fact_overlap_score(clean_unit, existing) >= 0.72 for existing in existing_values):
+            continue
+        _append_fact(note.residual_supported_facts, _build_supported_fact(clean_unit, verified_rows, fallback_hits))
+        existing_values.append(clean_unit)
+    note.debug = {"metadata_hints": metadata_hints, "source_units": filtered_source_units}
     return note
 
 
@@ -598,19 +772,20 @@ def _looks_like_normal_finding(text: str) -> bool:
 
 
 def _filter_presentable_facts(field_name: str, facts: list[SupportedFact]) -> list[SupportedFact]:
-    if field_name not in {"positive_ros", "positive_physical_exam", "residual_supported_facts"}:
-        return facts
     filtered: list[SupportedFact] = []
+    seen: set[str] = set()
     for fact in facts:
         clean = _clean_fact_value(fact.value)
-        if not clean:
+        if field_name not in METADATA_FIELD_NAMES:
+            clean = _strip_low_value_clauses(clean)
+        clean = _clean_fact_value(clean)
+        if not clean or _should_drop_fact_value(field_name, clean):
             continue
-        if _looks_like_normal_finding(clean):
-            if field_name in {"positive_ros", "positive_physical_exam"}:
-                continue
-            if PE_SIGNAL_RE.search(clean) or ROS_SIGNAL_RE.search(clean):
-                continue
-        filtered.append(fact)
+        key = clean.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(fact if clean == fact.value else fact.model_copy(update={"value": clean}))
     return filtered
 
 
@@ -634,10 +809,13 @@ def _render_intro_items(note: TruthLayerNote) -> list[PresentationItem]:
         start = f"{start}, at {facility}"
     if provider:
         start = f"{start}, {provider}"
-    detail = f"documented {note_type}" if note_type else "documented the note"
-    sentence = f"{start} {detail}"
     if patient:
-        sentence = f"{sentence} for {patient}"
+        sentence = f"{start} documented that {patient} presented for evaluation"
+    elif note_type:
+        article = "an" if note_type[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        sentence = f"{start} documented {article} {note_type}"
+    else:
+        sentence = f"{start} documented the encounter"
     return [_item(sentence, field_name="intro", note=note, facts=facts, index=1)]
 
 
@@ -648,23 +826,25 @@ def _render_field_items(note: TruthLayerNote, field_name: str) -> list[Presentat
     if field_name == "residual_supported_facts":
         return [_item(fact.value, field_name=field_name, note=note, facts=[fact], index=index) for index, fact in enumerate(facts, start=1)]
     value_text = _format_fact_values(facts)
+    patient = _first_value(note, "patient_reference")
+    patient_subject = patient or "The patient"
     templates = {
-        "chief_complaint": f"Chief complaint was {value_text}",
-        "hpi": f"History of present illness documented {value_text}",
+        "chief_complaint": f"{patient_subject} presented with {value_text}",
+        "hpi": f"History of present illness included {value_text}",
         "pmh": f"Past medical history included {value_text}",
         "psh": f"Past surgical history included {value_text}",
-        "social_history": f"Social history documented {value_text}",
-        "allergies": f"Allergies were {value_text}",
-        "medications": f"Medications included {value_text}",
+        "social_history": f"Social history included {value_text}",
+        "allergies": f"Allergies were documented as {value_text}",
+        "medications": f"Current medications included {value_text}",
         "vitals": f"Vitals included {value_text}",
-        "abnormal_labs": f"Abnormal labs included {value_text}",
+        "abnormal_labs": f"Abnormal lab findings included {value_text}",
         "diagnoses": f"Diagnoses included {value_text}",
-        "assessment": f"Assessment documented {value_text}",
+        "assessment": f"Assessment included {value_text}",
         "treatment": f"Treatment included {value_text}",
         "plan": f"Plan included {value_text}",
-        "follow_up": f"Follow up included {value_text}",
+        "follow_up": f"Follow-up included {value_text}",
         "positive_ros": f"Positive review of systems findings included {value_text}",
-        "positive_physical_exam": f"Positive physical exam findings included {value_text}",
+        "positive_physical_exam": f"Abnormal physical examination findings included {value_text}",
     }
     sentence = templates.get(field_name)
     if not sentence:

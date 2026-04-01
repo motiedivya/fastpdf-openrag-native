@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +20,7 @@ class OpenRAGGateway:
     def __init__(self, settings: AppSettings | None = None):
         self.settings = settings or get_settings()
         self._cached_api_key: str | None = None
+        self._debug_events: list[dict[str, Any]] = []
 
     @classmethod
     def _get_agent_override_lock(cls) -> asyncio.Lock:
@@ -121,6 +124,46 @@ class OpenRAGGateway:
         )
 
     @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if hasattr(value, "model_dump"):
+            try:
+                value = value.model_dump(mode="json")
+            except TypeError:
+                value = value.model_dump()
+        if isinstance(value, dict):
+            return {str(key): OpenRAGGateway._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [OpenRAGGateway._json_safe(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _record_debug_event(
+        self,
+        *,
+        operation: str,
+        endpoint: str,
+        request_body: Any = None,
+        response_body: Any = None,
+        response_status: int | None = None,
+        extra: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        event = {
+            "operation": str(operation or "").strip(),
+            "endpoint": str(endpoint or "").strip(),
+            "request_body": self._json_safe(request_body),
+            "response_body": self._json_safe(response_body),
+            "response_status": int(response_status) if response_status is not None else None,
+            "extra": self._json_safe(extra or {}),
+            "error": str(error or "").strip() or None,
+        }
+        self._debug_events.append(event)
+
+    def export_debug_events(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._debug_events)
+
+    @staticmethod
     def _filter_allowed_sources(
         sources: list[EvidenceHit],
         *,
@@ -180,18 +223,25 @@ class OpenRAGGateway:
         }
 
     async def apply_recommended_settings(self) -> dict[str, object]:
+        update_payload = {
+            "chunk_size": self.settings.default_chunk_size,
+            "chunk_overlap": self.settings.default_chunk_overlap,
+            "table_structure": True,
+            "ocr": False,
+            "picture_descriptions": False,
+        }
         async with self._client() as client:
-            await client.settings.update(
-                {
-                    "chunk_size": self.settings.default_chunk_size,
-                    "chunk_overlap": self.settings.default_chunk_overlap,
-                    "table_structure": True,
-                    "ocr": False,
-                    "picture_descriptions": False,
-                }
-            )
+            await client.settings.update(update_payload)
             settings = await client.settings.get()
-        return settings.model_dump()
+        payload = settings.model_dump()
+        self._record_debug_event(
+            operation="settings.update",
+            endpoint="/api/v1/settings",
+            request_body=update_payload,
+            response_body=payload,
+            response_status=200,
+        )
+        return payload
 
     async def ingest_manifest(
         self,
@@ -234,22 +284,166 @@ class OpenRAGGateway:
                     successful_files = 0
                     failed_files = 1
                     delete_error = f"{delete_error}; {exc}" if delete_error else str(exc)
-                results.append(
-                    IngestedDocumentResult(
-                        filename=document.source_filename,
-                        status=f"{task_status} (delete skipped)" if delete_error else task_status,
-                        successful_files=successful_files,
-                        failed_files=failed_files,
-                        task_id=task_id,
-                        delete_error=delete_error,
-                    )
+                result_row = IngestedDocumentResult(
+                    filename=document.source_filename,
+                    status=f"{task_status} (delete skipped)" if delete_error else task_status,
+                    successful_files=successful_files,
+                    failed_files=failed_files,
+                    task_id=task_id,
+                    delete_error=delete_error,
                 )
+                self._record_debug_event(
+                    operation="documents.ingest",
+                    endpoint="/api/v1/documents",
+                    request_body={"file_path": (manifest_dir / document.relative_path).as_posix(), "filename": document.source_filename, "replace_existing": replace_existing},
+                    response_body=result_row.model_dump(mode="json"),
+                    response_status=200,
+                )
+                results.append(result_row)
         return results
 
     async def task_status(self, task_id: str) -> dict[str, object]:
         async with self._client() as client:
             task = await client.documents.get_task_status(task_id)
-        return task.model_dump()
+        payload = task.model_dump()
+        self._record_debug_event(
+            operation="documents.task_status",
+            endpoint=f"/api/v1/documents/tasks/{task_id}",
+            request_body={"task_id": task_id},
+            response_body=payload,
+            response_status=200,
+        )
+        return payload
+
+    async def ingest_file(
+        self,
+        file_path: Path,
+        *,
+        replace_existing: bool = True,
+    ) -> IngestedDocumentResult:
+        path = Path(file_path).expanduser().resolve()
+        filename = path.name
+        delete_error: str | None = None
+        async with self._client() as client:
+            if replace_existing:
+                try:
+                    await client.documents.delete(filename)
+                except OpenRAGError as exc:
+                    delete_error = str(exc)
+            try:
+                task = await client.documents.ingest(
+                    file_path=path,
+                    wait=True,
+                    timeout=self.settings.openrag_ingest_wait_timeout,
+                )
+                task_status = task.status
+                task_id = task.task_id
+                successful_files = task.successful_files
+                failed_files = task.failed_files
+            except TimeoutError as exc:
+                task_status = f"timeout after {self.settings.openrag_ingest_wait_timeout}s"
+                task_id = None
+                successful_files = 0
+                failed_files = 1
+                delete_error = f"{delete_error}; {exc}" if delete_error else str(exc)
+        result = IngestedDocumentResult(
+            filename=filename,
+            status=f"{task_status} (delete skipped)" if delete_error else task_status,
+            successful_files=successful_files,
+            failed_files=failed_files,
+            task_id=task_id,
+            delete_error=delete_error,
+        )
+        self._record_debug_event(
+            operation="documents.ingest",
+            endpoint="/api/v1/documents",
+            request_body={"file_path": path.as_posix(), "filename": filename, "replace_existing": replace_existing},
+            response_body=result.model_dump(mode="json"),
+            response_status=200,
+        )
+        return result
+
+    async def chat_request(
+        self,
+        *,
+        message: str,
+        filters: dict[str, Any] | None = None,
+        limit: int = 10,
+        score_threshold: float = 0,
+        filter_id: str | None = None,
+        chat_id: str | None = None,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "message": message,
+            "stream": False,
+            "limit": limit,
+            "score_threshold": score_threshold,
+        }
+        if filters:
+            body["filters"] = filters
+        if filter_id:
+            body["filter_id"] = filter_id
+        if chat_id:
+            body["chat_id"] = chat_id
+        async with self._client() as client:
+            async with self._temporary_agent_settings(
+                client,
+                llm_model=llm_model,
+                llm_provider=llm_provider,
+            ):
+                response = await client._request("POST", "/api/v1/chat", json=body)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_text": getattr(response, "text", "")}
+        self._record_debug_event(
+            operation="chat",
+            endpoint="/api/v1/chat",
+            request_body=body,
+            response_body=data,
+            response_status=getattr(response, "status_code", None),
+            extra={"llm_model": llm_model, "llm_provider": llm_provider},
+        )
+        return data if isinstance(data, dict) else {"response": str(data or "")}
+
+    async def search_request(
+        self,
+        *,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+        score_threshold: float | None = None,
+        filter_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "query": query,
+            "limit": limit if limit is not None else self.settings.verification_limit,
+            "score_threshold": (
+                score_threshold
+                if score_threshold is not None
+                else self.settings.verification_score_threshold
+            ),
+        }
+        if filters:
+            body["filters"] = filters
+        if filter_id:
+            body["filter_id"] = filter_id
+        async with self._client() as client:
+            response = await client._request("POST", "/api/v1/search", json=body)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_text": getattr(response, "text", "")}
+        self._record_debug_event(
+            operation="search",
+            endpoint="/api/v1/search",
+            request_body=body,
+            response_body=data,
+            response_status=getattr(response, "status_code", None),
+        )
+        return data if isinstance(data, dict) else {"results": []}
 
     async def chat_on_sources(
         self,
@@ -273,24 +467,15 @@ class OpenRAGGateway:
                 "data_sources": effective_sources,
                 "document_types": document_types or ["text/markdown", "text/html"],
             }
-        body: dict[str, Any] = {
-            "message": message,
-            "stream": False,
-            "limit": limit,
-            "score_threshold": score_threshold,
-        }
-        if filters:
-            body["filters"] = filters
-        if filter_id:
-            body["filter_id"] = filter_id
-        async with self._client() as client:
-            async with self._temporary_agent_settings(
-                client,
-                llm_model=llm_model,
-                llm_provider=llm_provider,
-            ):
-                response = await client._request("POST", "/api/v1/chat", json=body)
-        data = response.json()
+        data = await self.chat_request(
+            message=message,
+            filters=filters,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_id=filter_id,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+        )
         sources = self._coerce_evidence_hits(data.get("sources", []))
         filtered_sources = self._filter_allowed_sources(sources, data_sources=effective_sources)
         return str(data.get("response") or ""), filtered_sources
@@ -311,22 +496,13 @@ class OpenRAGGateway:
                 "data_sources": data_sources,
                 "document_types": document_types or ["text/markdown", "text/html"],
             }
-        body: dict[str, Any] = {
-            "query": query,
-            "limit": limit if limit is not None else self.settings.verification_limit,
-            "score_threshold": (
-                score_threshold
-                if score_threshold is not None
-                else self.settings.verification_score_threshold
-            ),
-        }
-        if filters:
-            body["filters"] = filters
-        if filter_id:
-            body["filter_id"] = filter_id
-        async with self._client() as client:
-            response = await client._request("POST", "/api/v1/search", json=body)
-        data = response.json()
+        data = await self.search_request(
+            query=query,
+            filters=filters,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_id=filter_id,
+        )
         results = self._coerce_evidence_hits(data.get("results", []))
         return self._filter_allowed_sources(results, data_sources=data_sources)
 
@@ -336,8 +512,10 @@ class OpenRAGGateway:
         manifest: MaterializationManifest,
         scope: SummaryScope,
         data_sources: list[str],
+        document_types: list[str] | None = None,
     ) -> KnowledgeFilterResult:
         filter_name = f"{self.settings.filter_prefix}:{manifest.run_id}:{scope.scope_id}"
+        operation = "create"
         async with self._client() as client:
             existing_id = None
             for candidate in await client.knowledge_filters.search(filter_name, limit=20):
@@ -345,17 +523,20 @@ class OpenRAGGateway:
                     existing_id = candidate.id
                     break
 
+            filter_payload: dict[str, Any] = {
+                "data_sources": data_sources,
+            }
+            if document_types:
+                filter_payload["document_types"] = list(document_types)
             query_data = {
                 "query": scope.objective,
-                "filters": {
-                    "data_sources": data_sources,
-                    "document_types": ["text/markdown", "text/html"],
-                },
+                "filters": filter_payload,
                 "limit": 10,
                 "scoreThreshold": 0,
             }
 
             if existing_id:
+                operation = "update"
                 await client.knowledge_filters.update(
                     existing_id,
                     {
@@ -376,8 +557,20 @@ class OpenRAGGateway:
                     raise RuntimeError("OpenRAG did not return a knowledge filter id")
                 filter_id = created.id
 
-        return KnowledgeFilterResult(
+        result = KnowledgeFilterResult(
             filter_id=filter_id,
             filter_name=filter_name,
             data_sources=data_sources,
         )
+        self._record_debug_event(
+            operation=f"knowledge_filter.{operation}",
+            endpoint="/api/v1/knowledge_filters",
+            request_body={
+                "filter_name": filter_name,
+                "scope": scope.model_dump(mode="json"),
+                "query_data": query_data,
+            },
+            response_body=result.model_dump(mode="json"),
+            response_status=200,
+        )
+        return result

@@ -653,7 +653,9 @@ def test_summarize_scope_filters_unsupported_sentences(tmp_path: Path) -> None:
     )
 
     assert result.draft_title == "Operative Sequence"
-    assert result.supported_summary == "Supported procedure detail."
+    assert result.debug["layered_output_used"] is True
+    assert "Grounded summary for page 2." in result.supported_summary
+    assert "fact-page-3." in result.supported_summary
     assert result.unsupported_sentences == ["Unsupported leap."]
 
 
@@ -820,7 +822,8 @@ def test_summarize_scope_retries_when_chat_skips_retrieval(tmp_path: Path) -> No
     assert result.page_summaries[0].summary == "Grounded retry page summary."
     assert result.debug["page_requests"][0]["retrieval_retry_used"] is True
     assert result.debug["reduce_retry_used"] is True
-    assert result.supported_summary == "Supported summary."
+    assert result.debug["layered_output_used"] is True
+    assert result.supported_summary == "Grounded retry page summary. retry-fact."
     assert result.unsupported_sentences == ["Unsupported leap."]
 
 
@@ -1457,18 +1460,21 @@ class LayeredOutputGateway:
                 json.dumps(
                     {
                         "title": "Layered Scope",
-                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. Chief complaint was possible right ear infection with right ear pain for a couple of weeks. History of present illness documented right ear pain for 2 weeks with prior upper respiratory infection resolved. Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Plan included ENT follow up with possible surgery or laser treatment.",
+                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented that Mr. Reazin presented for evaluation. Chief complaint was possible right ear infection with right ear pain for a couple of weeks. History of present illness documented right ear pain for 2 weeks with prior upper respiratory infection resolved. Allergies were documented as nkda. Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Treatment included possible surgery or laser treatment. Plan included ENT follow up with possible surgery or laser treatment. Follow-up included prn.",
                         "sections": [
                             {
                                 "title": "On 09/12/2018",
                                 "note_id": "note-001",
                                 "items": [
-                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin.", "fact_ids": ["note-001__intro__01"]},
+                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented that Mr. Reazin presented for evaluation.", "fact_ids": ["note-001__intro__01"]},
                                     {"text": "Chief complaint was possible right ear infection with right ear pain for a couple of weeks.", "fact_ids": ["note-001__chief_complaint__01"]},
                                     {"text": "History of present illness documented right ear pain for 2 weeks with prior upper respiratory infection resolved.", "fact_ids": ["note-001__hpi__01"]},
+                                    {"text": "Allergies were documented as nkda.", "fact_ids": ["note-001__allergies__01"]},
                                     {"text": "Medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
                                     {"text": "Diagnoses included otalgia right ear H92.01.", "fact_ids": ["note-001__diagnoses__01"]},
-                                    {"text": "Plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__plan__01"]}
+                                    {"text": "Treatment included possible surgery or laser treatment.", "fact_ids": ["note-001__treatment__01"]},
+                                    {"text": "Plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__plan__01"]},
+                                    {"text": "Follow-up included prn.", "fact_ids": ["note-001__follow_up__01"]}
                                 ]
                             }
                         ]
@@ -1481,16 +1487,20 @@ class LayeredOutputGateway:
                 json.dumps(
                     {
                         "title": "Layered Scope",
-                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin. He reported possible right ear infection with right ear pain for a couple of weeks, and the history of present illness noted a resolved prior upper respiratory infection. Medications on file included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. The assessment documented otalgia right ear H92.01, and the plan included ENT follow up with possible surgery or laser treatment.",
+                        "narrative": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented that Mr. Reazin presented for evaluation. He reported possible right ear infection with right ear pain for a couple of weeks, and the history of present illness noted a resolved prior upper respiratory infection. Allergies were documented as nkda. Current medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet. Diagnoses included otalgia right ear H92.01. Treatment included possible surgery or laser treatment. Plan included ENT follow up with possible surgery or laser treatment. Follow-up included prn.",
                         "sections": [
                             {
                                 "title": "On 09/12/2018",
                                 "note_id": "note-001",
                                 "items": [
-                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented a visit note for Mr. Reazin.", "fact_ids": ["note-001__intro__01"]},
+                                    {"text": "On 09/12/2018, at Clinica La Esperanza in Albuquerque, New Mexico, Susette Eaves CFNP documented that Mr. Reazin presented for evaluation.", "fact_ids": ["note-001__intro__01"]},
                                     {"text": "He reported possible right ear infection with right ear pain for a couple of weeks, and the history of present illness noted a resolved prior upper respiratory infection.", "fact_ids": ["note-001__chief_complaint__01", "note-001__hpi__01"]},
-                                    {"text": "Medications on file included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
-                                    {"text": "The assessment documented otalgia right ear H92.01, and the plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__diagnoses__01", "note-001__plan__01"]}
+                                    {"text": "Allergies were documented as nkda.", "fact_ids": ["note-001__allergies__01"]},
+                                    {"text": "Current medications included hydrocodone acetaminophen 5-325 mg tablet and oxycodone 5 mg tablet.", "fact_ids": ["note-001__medications__01"]},
+                                    {"text": "Diagnoses included otalgia right ear H92.01.", "fact_ids": ["note-001__diagnoses__01"]},
+                                    {"text": "Treatment included possible surgery or laser treatment.", "fact_ids": ["note-001__treatment__01"]},
+                                    {"text": "Plan included ENT follow up with possible surgery or laser treatment.", "fact_ids": ["note-001__plan__01"]},
+                                    {"text": "Follow-up included prn.", "fact_ids": ["note-001__follow_up__01"]}
                                 ]
                             }
                         ]
@@ -1549,6 +1559,198 @@ class LayeredOutputGateway:
             "Visit note documenting right ear pain and follow up planning.",
         }
         if query in supported_queries:
+            return [EvidenceHit(filename=data_sources[0], text="verified support", score=0.8)]
+        return []
+
+
+class PageFirstLayeredGateway(LayeredOutputGateway):
+    async def chat_on_sources(
+        self,
+        *,
+        message: str,
+        data_sources: list[str] | None = None,
+        limit: int = 6,
+        score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
+    ):
+        if "presentation-layer editor" in message:
+            self.override_calls.append(
+                {
+                    "message": message,
+                    "data_sources": list(data_sources or []),
+                    "llm_model": llm_model,
+                    "llm_provider": llm_provider,
+                    "disable_retrieval": disable_retrieval,
+                }
+            )
+            return (
+                json.dumps(
+                    {
+                        "title": "Layered Scope",
+                        "narrative": "This page documented the date of service and provider information for the visit note. The page states that right ear pain was discussed.",
+                        "sections": [
+                            {
+                                "title": "Page 1",
+                                "note_id": "note-001",
+                                "items": [
+                                    {
+                                        "text": "This page documented the date of service and provider information for the visit note.",
+                                        "fact_ids": ["note-001__intro__01"],
+                                    },
+                                    {
+                                        "text": "The page states that right ear pain was discussed.",
+                                        "fact_ids": ["note-001__chief_complaint__01"],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                [],
+            )
+        return await super().chat_on_sources(
+            message=message,
+            data_sources=data_sources,
+            limit=limit,
+            score_threshold=score_threshold,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+            disable_retrieval=disable_retrieval,
+        )
+
+
+
+class ResidualOnlyLayeredGateway:
+    def __init__(self) -> None:
+        self.override_calls: list[dict[str, object]] = []
+
+    async def chat_on_sources(
+        self,
+        *,
+        message: str,
+        data_sources: list[str] | None = None,
+        limit: int = 6,
+        score_threshold: float = 0,
+        llm_model: str | None = None,
+        llm_provider: str | None = None,
+        disable_retrieval: bool = False,
+    ):
+        self.override_calls.append(
+            {
+                "message": message,
+                "data_sources": list(data_sources or []),
+                "llm_model": llm_model,
+                "llm_provider": llm_provider,
+                "disable_retrieval": disable_retrieval,
+            }
+        )
+        source_name = (data_sources or ["fallback-source.md"])[0]
+        if "strict supported fact sheet" in message:
+            return (
+                json.dumps(
+                    {
+                        "date_of_service": [],
+                        "facility": [],
+                        "provider": [],
+                        "patient_reference": [],
+                        "note_type": [],
+                        "chief_complaint": [],
+                        "hpi": [],
+                        "pmh": [],
+                        "psh": [],
+                        "social_history": [],
+                        "allergies": [],
+                        "medications": [],
+                        "vitals": [],
+                        "abnormal_labs": [],
+                        "diagnoses": [],
+                        "assessment": [],
+                        "treatment": [],
+                        "plan": [],
+                        "follow_up": [],
+                        "positive_ros": [],
+                        "positive_physical_exam": [],
+                        "residual_supported_facts": ["Right knee pain improved with injections and therapy."],
+                    }
+                ),
+                [EvidenceHit(filename=source_name, text="structured residual support", score=0.9)],
+            )
+        if "presentation-layer renderer" in message:
+            return (
+                json.dumps(
+                    {
+                        "title": "Residual Layered Scope",
+                        "narrative": "The note documented right knee pain improved with injections and therapy.",
+                        "sections": [
+                            {
+                                "title": "Note 1",
+                                "note_id": "note-001",
+                                "items": [
+                                    {
+                                        "text": "The note documented right knee pain improved with injections and therapy.",
+                                        "fact_ids": ["note-001__residual_supported_facts__01"],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                [],
+            )
+        if "presentation-layer editor" in message:
+            return (
+                json.dumps(
+                    {
+                        "title": "Residual Layered Scope",
+                        "narrative": "The note documented right knee pain improved with injections and therapy.",
+                        "sections": [
+                            {
+                                "title": "Note 1",
+                                "note_id": "note-001",
+                                "items": [
+                                    {
+                                        "text": "The note documented right knee pain improved with injections and therapy.",
+                                        "fact_ids": ["note-001__residual_supported_facts__01"],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                [],
+            )
+        if "single page" in message:
+            return (
+                json.dumps(
+                    {
+                        "summary": "The note documented right knee pain improved with injections and therapy.",
+                        "key_facts": ["Right knee pain improved with injections and therapy."],
+                    }
+                ),
+                [EvidenceHit(filename=source_name, text="page support", score=0.9)],
+            )
+        return (
+            json.dumps(
+                {
+                    "title": "Residual Summary",
+                    "summary": "The note documented right knee pain improved with injections and therapy.",
+                    "chronology": ["The note documented right knee pain improved with injections and therapy."],
+                }
+            ),
+            [EvidenceHit(filename=source_name, text="reduce support", score=0.8)],
+        )
+
+    async def search_on_sources(
+        self,
+        *,
+        query: str,
+        data_sources: list[str],
+        limit: int | None = None,
+        score_threshold: float | None = None,
+    ):
+        if data_sources:
             return [EvidenceHit(filename=data_sources[0], text="verified support", score=0.8)]
         return []
 
@@ -1618,6 +1820,101 @@ def test_summarize_scope_emits_truth_validation_and_presentation_layers(tmp_path
     assert any(call["llm_model"] == "gpt-5-extractor" for call in gateway.override_calls if "strict supported fact sheet" in str(call["message"]))
     assert any(call["llm_model"] == "gpt-5-renderer" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer renderer" in str(call["message"]))
     assert any(call["llm_model"] == "gpt-5-editor" and call["disable_retrieval"] is True for call in gateway.override_calls if "presentation-layer editor" in str(call["message"]))
+    assert result.debug["presentation_omission_audit"]["notes_with_missing_fields"] == 0
+    assert result.debug["presentation_quality_gate"]["selected_layer"] == "candidate"
+
+
+def test_summarize_scope_falls_back_to_deterministic_note_plan_when_editor_is_page_first(tmp_path: Path) -> None:
+    payload = {
+        "pdfs": [
+            {
+                "pdf_id": "visit-note.pdf",
+                "pages": [
+                    {
+                        "page": 1,
+                        "pdf2html_text": (
+                            "Date of Service 09/12/2018. Provider Susette Eaves CFNP. "
+                            "Possible right ear infection with right ear pain for a couple of weeks. "
+                            "NKDA. Hydrocodone acetaminophen 5-325 mg tablet. "
+                            "Diagnosis otalgia right ear H92.01. "
+                            "Possible surgery or laser treatment. ENT follow up PRN."
+                        ),
+                    },
+                ],
+            }
+        ]
+    }
+    materialize_summary_payload(
+        run_id="layered-page-first-run",
+        summary_payload=payload,
+        source_kind="summary_payload",
+        output_dir=tmp_path,
+    )
+    manifest = load_manifest(tmp_path / "manifest.json")
+    scope = SummaryScope.model_validate(
+        {
+            "scope_id": "layered-page-first-scope",
+            "title": "Layered Scope",
+            "objective": "Produce a detailed grounded visit note narrative.",
+            "page_refs": [{"pdf_id": "visit-note.pdf", "page": 1}],
+        }
+    )
+
+    result = asyncio.run(
+        summarize_scope(PageFirstLayeredGateway(), manifest=manifest, scope=scope)
+    )
+
+    assert result.presentation_plan is not None
+    assert result.presentation_layer is not None
+    assert result.presentation_layer.debug["renderer"] == "deterministic_plan"
+    assert result.debug["layered_output_used"] is True
+    assert result.debug["layered_output_fallback_reason"] == "forbidden_page_language"
+    assert result.debug["presentation_quality_gate"]["selected_layer"] == "deterministic_plan"
+    assert result.supported_summary.startswith("On 09/12/2018")
+    assert "this page" not in result.supported_summary.lower()
+    assert "nkda" in result.supported_summary.lower()
+    assert "follow-up included prn" in result.supported_summary.lower()
+
+
+
+def test_summarize_scope_uses_layered_output_for_residual_only_notes(tmp_path: Path) -> None:
+    payload = {
+        "pdfs": [
+            {
+                "pdf_id": "visit-note.pdf",
+                "pages": [
+                    {"page": 1, "pdf2html_text": "Visit note page one"},
+                ],
+            }
+        ]
+    }
+    materialize_summary_payload(
+        run_id="layered-residual-run",
+        summary_payload=payload,
+        source_kind="summary_payload",
+        output_dir=tmp_path,
+    )
+    manifest = load_manifest(tmp_path / "manifest.json")
+    scope = SummaryScope.model_validate(
+        {
+            "scope_id": "layered-residual-scope",
+            "title": "Layered Residual Scope",
+            "objective": "Produce a detailed grounded visit note narrative.",
+            "page_refs": [{"pdf_id": "visit-note.pdf", "page": 1}],
+        }
+    )
+
+    result = asyncio.run(
+        summarize_scope(ResidualOnlyLayeredGateway(), manifest=manifest, scope=scope)
+    )
+
+    assert result.truth_layer
+    assert result.presentation_layer is not None
+    assert result.debug["layered_output_structured"] is False
+    assert result.debug["layered_output_used"] is True
+    assert result.supported_summary == "The note documented right knee pain improved with injections and therapy."
+    assert result.debug["note_group_debug"]["note_count"] == 1
+    assert result.debug["presentation_omission_audit"]["notes_with_missing_fields"] == 0
 
 
 def test_summarize_scope_uses_local_inventory_fallback_when_retrieval_returns_empty(tmp_path: Path) -> None:

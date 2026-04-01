@@ -203,9 +203,15 @@ def test_ensure_summary_citations_writes_artifacts_and_grounding(tmp_path: Path)
     assert first.page == 1
     assert first.page_key == "run-1-pdf::1"
     assert first.page_source_filename == "run-1__p0001.html"
-    assert len(first.boxes) == 2
-    assert first.bbox == {"left": 10, "top": 20, "right": 352, "bottom": 114, "width": 342, "height": 94}
+    assert len(first.boxes) == 1
+    assert first.anchor == "run-1-pdf:1:p1-1"
+    assert first.bbox == {"left": 10, "top": 20, "right": 330, "bottom": 60, "width": 320, "height": 40}
     assert first.degraded is False
+
+    second = summary.citation_index[1]
+    assert len(second.boxes) == 1
+    assert second.anchor == "run-1-pdf:1:p2-2"
+    assert second.bbox == {"left": 12, "top": 72, "right": 352, "bottom": 114, "width": 340, "height": 42}
 
     persisted_summary = ScopedSummaryResult.model_validate_json(summary_path.read_text(encoding="utf-8"))
     assert persisted_summary.citation_index == summary.citation_index
@@ -218,7 +224,7 @@ def test_ensure_summary_citations_writes_artifacts_and_grounding(tmp_path: Path)
     assert len(persisted_instances) >= len(persisted_index)
     persisted_resolved = json.loads(resolved_citations_path.read_text(encoding="utf-8"))
     section_kinds = {section["kind"] for section in persisted_resolved["sections"]}
-    assert {"supported_summary", "chronology", "page_summary", "key_facts", "draft_summary", "unsupported_summary"} <= section_kinds
+    assert {"supported_summary", "chronology", "page_summary", "draft_summary", "unsupported_summary"} <= section_kinds
     draft_section = next(section for section in persisted_resolved["sections"] if section["kind"] == "draft_summary")
     assert len(draft_section["items"]) == 2
 
@@ -314,3 +320,154 @@ def test_build_summary_view_model_exposes_citation_urls_and_numbers(tmp_path: Pa
     assert model["artifacts"]["citation_instances"]["url"] == "/debug/sentence_citation_instances.json"
     assert model["artifacts"]["resolved_citations"]["url"] == "/debug/resolved_citations.json"
     assert model["artifacts"]["source_pdf_copy"]["url"] == "/debug/source.pdf"
+
+
+def test_ensure_summary_citations_scales_normalized_boxes(tmp_path: Path) -> None:
+    extraction_dir = tmp_path / "data" / "extracted" / "run-norm"
+    output_dir = tmp_path / "outputs" / "run-norm"
+    pages_dir = extraction_dir / "pages"
+    retrieval_dir = extraction_dir / "retrieval"
+    artifacts_dir = extraction_dir / "artifacts"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    retrieval_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_pdf = tmp_path / "fixtures" / "source.pdf"
+    source_pdf.parent.mkdir(parents=True, exist_ok=True)
+    source_pdf.write_bytes(b"%PDF-1.4\n% citation test\n")
+
+    page_html_path = pages_dir / "run-norm__p0001.html"
+    page_html_path.write_text(
+        build_html_document(
+            source_pdf="source.pdf",
+            page_number=1,
+            image_filename="../artifacts/run-norm__p0001.png",
+            width=1000,
+            height=1000,
+            paragraphs=[
+                {
+                    "block_index": 1,
+                    "paragraph_index": 1,
+                    "page_paragraph_index": 1,
+                    "text": "Localized medial knee pain was documented.",
+                    "bbox": {"left": 100, "top": 100, "width": 200, "height": 100},
+                }
+            ],
+            full_text="Localized medial knee pain was documented.",
+        ),
+        encoding="utf-8",
+    )
+
+    chunk_filename = "run-norm__p0001__c0001.md"
+    chunk_path = retrieval_dir / chunk_filename
+    chunk_path.write_text(
+        "\n".join(["# Retrieval Chunk", "## Evidence Text", "Localized medial knee pain was documented."]),
+        encoding="utf-8",
+    )
+
+    hit = EvidenceHit(
+        filename=chunk_filename,
+        text="Localized medial knee pain was documented.",
+        score=0.93,
+        page=1,
+    )
+
+    manifest = MaterializationManifest(
+        run_id="run-norm",
+        source_kind="summary_payload",
+        total_pages=1,
+        materialized_pages=1,
+        retrieval_document_count=1,
+        page_documents=[
+            MaterializedPage(
+                run_id="run-norm",
+                pdf_id="run-norm-pdf",
+                page=1,
+                order_index=1,
+                source_filename="run-norm__p0001.html",
+                relative_path="pages/run-norm__p0001.html",
+                document_type="text/html",
+                text_length=40,
+                text_preview="Localized medial knee pain was documented.",
+                retrieval_filenames=[chunk_filename],
+                retrieval_relative_paths=["retrieval/run-norm__p0001__c0001.md"],
+                metadata={
+                    "paragraph_count": 1,
+                    "bbox_space": "normalized_1000",
+                    "page_width": 800,
+                    "page_height": 1200,
+                },
+            )
+        ],
+        retrieval_documents=[
+            MaterializedRetrievalDocument(
+                run_id="run-norm",
+                pdf_id="run-norm-pdf",
+                page=1,
+                order_index=1,
+                chunk_index=1,
+                source_filename=chunk_filename,
+                relative_path="retrieval/run-norm__p0001__c0001.md",
+                text_length=40,
+                text_preview="Localized medial knee pain was documented.",
+                parent_source_filename="run-norm__p0001.html",
+                metadata={
+                    "block_start": 1,
+                    "block_end": 1,
+                    "paragraph_start": 1,
+                    "paragraph_end": 1,
+                    "page_paragraph_start": 1,
+                    "page_paragraph_end": 1,
+                    "paragraph_refs": [
+                        {"block_index": 1, "paragraph_index": 1, "page_paragraph_index": 1},
+                    ],
+                },
+            )
+        ],
+    )
+    manifest_path = extraction_dir / "manifest.json"
+    manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+
+    summary = ScopedSummaryResult(
+        run_id="run-norm",
+        scope=SummaryScope(
+            scope_id="all-pages",
+            title="All Pages",
+            objective="Produce a grounded summary.",
+            page_refs=[PageRef(pdf_id="run-norm-pdf", page=1)],
+        ),
+        source_filenames=[chunk_filename],
+        page_summaries=[
+            PageMapSummary(
+                pdf_id="run-norm-pdf",
+                page=1,
+                source_filename="run-norm__p0001.html",
+                summary="Localized medial knee pain was documented.",
+                key_facts=[],
+                raw_response="Localized medial knee pain was documented.",
+                retrieved_sources=[hit],
+                verified_sentences=[VerifiedSentence(sentence="Localized medial knee pain was documented.", supported=True, evidence=[hit])],
+                supported_summary="Localized medial knee pain was documented.",
+                passed_verification=True,
+            )
+        ],
+        draft_title="All Pages Summary",
+        draft_summary="Localized medial knee pain was documented.",
+        chronology=[],
+        verified_sentences=[VerifiedSentence(sentence="Localized medial knee pain was documented.", supported=True, evidence=[hit])],
+        supported_summary="Localized medial knee pain was documented.",
+    )
+    summary_path = output_dir / "all-pages.summary.json"
+    summary_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+
+    resolved_summary, *_ = ensure_summary_citations(
+        summary_path=summary_path,
+        manifest_path=manifest_path,
+        source_pdf=source_pdf,
+    )
+
+    first = resolved_summary.citation_index[0]
+    assert first.degraded is False
+    assert len(first.boxes) == 1
+    assert first.bbox == {"left": 80, "top": 120, "right": 240, "bottom": 240, "width": 160, "height": 120}

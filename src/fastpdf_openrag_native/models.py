@@ -10,6 +10,15 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+DEFAULT_MEDICAL_NOTE_OBJECTIVE = (
+    "Produce a grounded note-first medical/legal summary of the selected pages. "
+    "Build one note/date object at a time, preserve chronology, and keep unrelated encounters separate. "
+    "Prioritize chief complaint/HPI, diagnoses, abnormal findings, imaging/labs, medications/allergies, treatment, "
+    "plan, and follow-up. Suppress header/footer/admin metadata, addresses, phone or fax details, and routine "
+    "normal findings unless they are clinically necessary. Do not invent facts."
+)
+
+
 class MaterializedPage(BaseModel):
     run_id: str
     pdf_id: str
@@ -125,10 +134,7 @@ class PageRef(BaseModel):
 class SummaryScope(BaseModel):
     scope_id: str
     title: str
-    objective: str = (
-        "Produce a grounded medical/legal summary of the selected pages. "
-        "Do not invent facts and keep chronology intact."
-    )
+    objective: str = DEFAULT_MEDICAL_NOTE_OBJECTIVE
     page_refs: list[PageRef] = Field(default_factory=list)
 
 

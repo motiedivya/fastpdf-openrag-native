@@ -9,6 +9,8 @@ import json
 import math
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from collections import Counter
 from difflib import SequenceMatcher
 from typing import Optional, Any, Dict
@@ -22,6 +24,41 @@ from dependencies import get_chat_service, get_search_service, get_session_manag
 from session_manager import User
 
 logger = get_logger(__name__)
+
+
+_DEBUG_ROOT = Path(os.getenv("FASTPDF_OPENRAG_DEBUG_ROOT", "/app/openrag-documents/debug"))
+_REDACTED_HEADER_KEYS = {"authorization", "x-api-key", "api-key"}
+
+
+def _json_safe(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            value = value.model_dump(mode="json")
+        except TypeError:
+            value = value.model_dump()
+        except Exception:
+            value = str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _append_debug_record(stream_name: str, payload: dict[str, Any]) -> None:
+    try:
+        _DEBUG_ROOT.mkdir(parents=True, exist_ok=True)
+        file_path = _DEBUG_ROOT / f"{stream_name}.jsonl"
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **_json_safe(payload),
+        }
+        with file_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed writing %s debug record", stream_name=stream_name, error=str(exc))
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]*")
@@ -506,6 +543,20 @@ async def chat_create_endpoint(
     user_id = user.user_id
     jwt_token = user.jwt_token
 
+    _append_debug_record(
+        "api_v1_chat_requests",
+        {
+            "user_id": user_id,
+            "message": message,
+            "stream": body.stream,
+            "chat_id": body.chat_id,
+            "filter_id": body.filter_id,
+            "filters": body.filters,
+            "limit": body.limit,
+            "score_threshold": body.score_threshold,
+        },
+    )
+
     if body.filters:
         set_search_filters(body.filters)
     set_search_limit(body.limit)
@@ -556,11 +607,26 @@ async def chat_create_endpoint(
                     limit=body.limit,
                 )
                 sources = _filter_allowed_sources(sources, body.filters)
-        return JSONResponse({
+        response_payload = {
             "response": result.get("response", ""),
             "chat_id": chat_id,
             "sources": sources,
-        })
+        }
+        _append_debug_record(
+            "api_v1_chat_responses",
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "filter_id": body.filter_id,
+                "filters": body.filters,
+                "limit": body.limit,
+                "score_threshold": body.score_threshold,
+                "tool_queries": tool_queries,
+                "source_count": len(sources),
+                "response": response_payload,
+            },
+        )
+        return JSONResponse(response_payload)
 
 
 async def chat_list_endpoint(

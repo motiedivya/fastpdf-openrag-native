@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .layered_output import extract_truth_layer_note, group_truth_layer_notes, render_presentation_layer, validate_truth_layer
-from .models import EvidenceHit, MaterializationManifest, PageMapSummary, ScopedSummaryResult, SummaryScope, VerifiedSentence
+from .models import EvidenceHit, MaterializationManifest, PageMapSummary, PresentationLayer, ScopedSummaryResult, SummaryScope, TruthLayerNote, VerifiedSentence
 from .prompts import build_page_local_fallback_prompt, build_page_map_prompt, build_reduce_prompt
 from .reranking import RERANKER_TYPE, attach_rank_metadata, rerank_hits, select_top_source_filenames
 from .settings import AppSettings, get_settings
@@ -95,6 +95,11 @@ HEADER_BIAS_TERMS = (
     "document status",
     "phone msg",
     "forwarded by",
+)
+PRESENTATION_FORBIDDEN_PHRASES = (
+    "this page",
+    "this document",
+    "the page states",
 )
 HIGH_VALUE_SECTION_TERMS = (
     "subjective",
@@ -981,6 +986,236 @@ def _verification_reranker_type(settings: AppSettings) -> str | None:
     return None
 
 
+def _normalize_audit_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def _fact_appears_in_rendered_text(*, fact_value: str, rendered_text: str) -> bool:
+    normalized_fact = _normalize_audit_text(fact_value)
+    normalized_rendered = _normalize_audit_text(rendered_text)
+    if not normalized_fact:
+        return True
+    if normalized_fact in normalized_rendered:
+        return True
+    fact_tokens = [token for token in UNIT_TOKEN_RE.findall(normalized_fact) if len(token) > 1]
+    rendered_tokens = set(token for token in UNIT_TOKEN_RE.findall(normalized_rendered) if len(token) > 1)
+    if not fact_tokens or not rendered_tokens:
+        return False
+    matched = sum(1 for token in fact_tokens if token in rendered_tokens)
+    required_matches = 1 if len(fact_tokens) <= 2 else min(len(fact_tokens), 3)
+    return matched >= required_matches
+
+
+def _build_note_group_debug(notes: list[TruthLayerNote]) -> dict[str, Any]:
+    return {
+        "note_count": len(notes),
+        "notes": [
+            {
+                "note_id": note.note_id,
+                "pdf_ids": list(note.pdf_ids),
+                "page_count": len(note.pages),
+                "pages": list(note.pages),
+                "date_of_service": note.field_values("date_of_service"),
+                "facility": note.field_values("facility"),
+                "provider": note.field_values("provider"),
+                "note_type": note.field_values("note_type"),
+                "residual_supported_facts": note.field_values("residual_supported_facts"),
+                "group_key": note.debug.get("group_key"),
+            }
+            for note in notes
+        ],
+    }
+
+
+def _build_presentation_omission_audit(notes: list[TruthLayerNote], *, rendered_text: str) -> dict[str, Any]:
+    important_fields = (
+        "chief_complaint",
+        "hpi",
+        "pmh",
+        "psh",
+        "social_history",
+        "allergies",
+        "medications",
+        "abnormal_labs",
+        "diagnoses",
+        "assessment",
+        "treatment",
+        "plan",
+        "follow_up",
+    )
+    note_audits: list[dict[str, Any]] = []
+    for note in notes:
+        missing_fields: list[str] = []
+        field_status: list[dict[str, Any]] = []
+        for field_name in important_fields:
+            values = [value for value in note.field_values(field_name) if str(value or "").strip()]
+            if not values:
+                continue
+            matched = any(_fact_appears_in_rendered_text(fact_value=value, rendered_text=rendered_text) for value in values)
+            if not matched:
+                missing_fields.append(field_name)
+            field_status.append(
+                {
+                    "field_name": field_name,
+                    "value_count": len(values),
+                    "matched_in_rendered_text": matched,
+                    "values": values,
+                }
+            )
+        note_audits.append(
+            {
+                "note_id": note.note_id,
+                "pages": list(note.pages),
+                "missing_fields": missing_fields,
+                "field_status": field_status,
+            }
+        )
+    return {
+        "note_count": len(note_audits),
+        "notes_with_missing_fields": sum(1 for note in note_audits if note["missing_fields"]),
+        "missing_field_count": sum(len(note["missing_fields"]) for note in note_audits),
+        "notes": note_audits,
+    }
+
+
+def _presentation_layer_narrative(layer: PresentationLayer | None) -> str:
+    if layer is None:
+        return ""
+    if layer.narrative:
+        return _sanitize_generated_text(layer.narrative)
+    paragraphs = [
+        " ".join(_ensure_sentence(item.text) for item in section.items if _ensure_sentence(item.text)).strip()
+        for section in layer.sections
+        if section.items
+    ]
+    return _sanitize_generated_text("\n\n".join(paragraphs).strip())
+
+
+def _verified_sentences_from_presentation_layer(layer: PresentationLayer | None) -> list[VerifiedSentence]:
+    if layer is None:
+        return []
+    verified: list[VerifiedSentence] = []
+    for section in layer.sections:
+        for item in section.items:
+            sentence = _ensure_sentence(item.text)
+            if not sentence:
+                continue
+            verified.append(
+                VerifiedSentence(
+                    sentence=sentence,
+                    supported=True,
+                    evidence=list(item.evidence),
+                )
+            )
+    return verified
+
+
+def _build_presentation_quality_gate(
+    notes: list[TruthLayerNote],
+    *,
+    layer: PresentationLayer | None,
+) -> dict[str, Any]:
+    narrative = _presentation_layer_narrative(layer)
+    omission_audit = _build_presentation_omission_audit(notes, rendered_text=narrative)
+    lowered = narrative.lower()
+    forbidden_phrases = [phrase for phrase in PRESENTATION_FORBIDDEN_PHRASES if phrase in lowered]
+    note_audits: list[dict[str, Any]] = []
+    sections = list(layer.sections) if layer is not None else []
+    for index, note in enumerate(notes):
+        section = next((row for row in sections if row.note_id == note.note_id), None)
+        if section is None and index < len(sections):
+            section = sections[index]
+        section_text = " ".join(_ensure_sentence(item.text) for item in (section.items if section else [])).strip()
+        first_sentence = _ensure_sentence(section.items[0].text) if section and section.items else ""
+        issues: list[str] = []
+        if note.field_values("date_of_service") and not first_sentence.lower().startswith("on "):
+            issues.append("missing_required_opening")
+        patient_values = [value for value in note.field_values("patient_reference") if str(value or "").strip()]
+        if patient_values and section_text:
+            if not any(_fact_appears_in_rendered_text(fact_value=value, rendered_text=section_text) for value in patient_values):
+                issues.append("missing_patient_reference")
+        elif patient_values:
+            issues.append("missing_patient_reference")
+        if any(phrase in section_text.lower() for phrase in PRESENTATION_FORBIDDEN_PHRASES):
+            issues.append("forbidden_page_language")
+        note_audits.append(
+            {
+                "note_id": note.note_id,
+                "pages": list(note.pages),
+                "issues": issues,
+                "first_sentence": first_sentence,
+                "section_text": section_text,
+            }
+        )
+    return {
+        "narrative": narrative,
+        "forbidden_phrases": forbidden_phrases,
+        "notes_missing_required_opening": sum(1 for row in note_audits if "missing_required_opening" in row["issues"]),
+        "notes_missing_patient_reference": sum(1 for row in note_audits if "missing_patient_reference" in row["issues"]),
+        "notes_with_page_language": sum(1 for row in note_audits if "forbidden_page_language" in row["issues"]),
+        "note_audits": note_audits,
+        "omission_audit": omission_audit,
+    }
+
+
+def _select_presentation_output(
+    notes: list[TruthLayerNote],
+    *,
+    plan_layer: PresentationLayer,
+    candidate_layer: PresentationLayer | None,
+) -> tuple[PresentationLayer, list[VerifiedSentence], str, dict[str, Any], str | None]:
+    plan_quality = _build_presentation_quality_gate(notes, layer=plan_layer)
+    candidate_quality = _build_presentation_quality_gate(notes, layer=candidate_layer)
+    selected_layer = candidate_layer or plan_layer
+    selection = "candidate"
+    reason: str | None = None
+
+    if candidate_layer is None:
+        selection = "deterministic_plan"
+        reason = "missing_presentation_layer"
+        selected_layer = plan_layer
+    elif candidate_quality["forbidden_phrases"]:
+        selection = "deterministic_plan"
+        reason = "forbidden_page_language"
+        selected_layer = plan_layer
+    elif candidate_quality["notes_missing_required_opening"] > 0:
+        selection = "deterministic_plan"
+        reason = "missing_note_opening"
+        selected_layer = plan_layer
+    elif candidate_quality["notes_missing_patient_reference"] > 0:
+        selection = "deterministic_plan"
+        reason = "missing_patient_reference"
+        selected_layer = plan_layer
+    elif candidate_quality["notes_with_page_language"] > 0:
+        selection = "deterministic_plan"
+        reason = "section_level_page_language"
+        selected_layer = plan_layer
+    elif candidate_quality["omission_audit"].get("missing_field_count", 0) > plan_quality["omission_audit"].get("missing_field_count", 0):
+        selection = "deterministic_plan"
+        reason = "completeness_fallback"
+        selected_layer = plan_layer
+
+    selected_narrative = _presentation_layer_narrative(selected_layer)
+    selected_verified_sentences = _verified_sentences_from_presentation_layer(selected_layer)
+    quality_gate = {
+        "selected_layer": selection,
+        "reason": reason,
+        "candidate": candidate_quality,
+        "plan": plan_quality,
+    }
+    selected_layer = selected_layer.model_copy(
+        update={
+            "debug": {
+                **dict(selected_layer.debug),
+                "quality_gate": quality_gate,
+                "selected_layer": selection,
+                "selected_reason": reason,
+            }
+        }
+    )
+    return selected_layer, selected_verified_sentences, selected_narrative, quality_gate, reason
+
+
 async def _summarize_page(
     gateway: RetrievalGateway,
     scope: SummaryScope,
@@ -1582,10 +1817,12 @@ async def summarize_scope(
     presentation_draft = None
     presentation_layer = None
     layered_output_used = False
+    layered_output_fallback_reason = None
     layered_output_structured = any(
         any(field_name != "residual_supported_facts" for field_name in note.populated_fields())
         for note in truth_layer
     )
+    presentation_quality_gate = None
     if truth_layer:
         (
             presentation_plan,
@@ -1599,15 +1836,51 @@ async def summarize_scope(
             scope=scope,
             settings=effective_settings,
         )
-        presentation_layer = presentation_candidate
-        if (
-            layered_output_structured
-            and presentation_supported_summary
-            and (validation_layer is None or validation_layer.passed or not supported_summary)
-        ):
-            supported_summary = presentation_supported_summary
-            verified_sentences = presentation_verified_sentences
+        if presentation_supported_summary:
+            (
+                presentation_layer,
+                selected_presentation_verified_sentences,
+                selected_presentation_summary,
+                presentation_quality_gate,
+                quality_gate_reason,
+            ) = _select_presentation_output(
+                list(truth_layer),
+                plan_layer=presentation_plan,
+                candidate_layer=presentation_candidate,
+            )
+            supported_summary = selected_presentation_summary
+            verified_sentences = selected_presentation_verified_sentences
             layered_output_used = True
+            if quality_gate_reason:
+                layered_output_fallback_reason = quality_gate_reason
+        else:
+            (
+                presentation_layer,
+                selected_presentation_verified_sentences,
+                selected_presentation_summary,
+                presentation_quality_gate,
+                quality_gate_reason,
+            ) = _select_presentation_output(
+                list(truth_layer),
+                plan_layer=presentation_plan,
+                candidate_layer=None,
+            )
+            if selected_presentation_summary:
+                supported_summary = selected_presentation_summary
+                verified_sentences = selected_presentation_verified_sentences
+                layered_output_used = True
+                layered_output_fallback_reason = quality_gate_reason or "empty_presentation_summary"
+            else:
+                layered_output_fallback_reason = "empty_presentation_summary"
+    else:
+        layered_output_fallback_reason = "no_truth_layer"
+
+    note_group_debug = _build_note_group_debug(list(truth_layer)) if truth_layer else {"note_count": 0, "notes": []}
+    presentation_omission_audit = (
+        _build_presentation_omission_audit(list(truth_layer), rendered_text=supported_summary)
+        if truth_layer and supported_summary
+        else {"note_count": 0, "notes_with_missing_fields": 0, "notes": []}
+    )
 
     return ScopedSummaryResult(
         run_id=manifest.run_id,
@@ -1666,5 +1939,9 @@ async def summarize_scope(
             "presentation_layer": presentation_layer.model_dump(mode="json") if presentation_layer else None,
             "layered_output_used": layered_output_used,
             "layered_output_structured": layered_output_structured,
+            "layered_output_fallback_reason": layered_output_fallback_reason,
+            "note_group_debug": note_group_debug,
+            "presentation_omission_audit": presentation_omission_audit,
+            "presentation_quality_gate": presentation_quality_gate,
         },
     )
